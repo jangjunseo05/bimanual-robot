@@ -38,7 +38,8 @@
 
   function fresh() {
     return { phase: "IDLE_AT_DOCK", phase_attempt: 0, active_order_id: null, current_location: "dock",
-      battery_percent: 100, orders: [], tickets: [], events: [], auto_paused: false, sequence: 0, event_sequence: 0, last_tick: Date.now() };
+      battery_percent: 100, orders: [], tickets: [], events: [], auto_paused: false, sequence: 0, event_sequence: 0, last_tick: Date.now(),
+      emergency: { active: false, at: null, order_id: null } };
   }
   // 손님·관제 탭이 같은 상태를 동시에 고치므로, 읽기-수정-쓰기를 IndexedDB 트랜잭션 하나로 묶어
   // 탭 사이 쓰기가 서로 덮어쓰지 않게 한다. IndexedDB 를 못 쓰면 이 탭 메모리에만 둔다.
@@ -91,6 +92,14 @@
   const queued = (s) => s.orders.filter((o) => o.state === "QUEUED")
     .sort((a, b) => b.priority - a.priority || a.sequence - b.sequence);
   const active = (s) => s.orders.find((o) => o.order_id === s.active_order_id) || null;
+  const accepted = (s) => s.orders.filter((o) => o.state === "ACCEPTED")
+    .sort((a, b) => b.priority - a.priority || a.sequence - b.sequence);
+  function startStatus(s) {
+    const next = accepted(s)[0] || null;
+    const reason = s.emergency.active ? "emergency_stop" : s.active_order_id ? "mission_running"
+      : !next ? "no_accepted_order" : null;
+    return { ready: reason === null, reason, order_id: next ? next.order_id : null };
+  }
 
   function startNext(s) {
     const next = queued(s)[0];
@@ -145,7 +154,7 @@
   function tick(s) {
     const steps = Math.min(20, Math.floor((Date.now() - s.last_tick) / STEP_MS));
     if (steps > 0) s.last_tick += steps * STEP_MS;
-    if (s.auto_paused) { s.last_tick = Date.now(); return; }
+    if (s.auto_paused || s.emergency.active) { s.last_tick = Date.now(); return; }
     for (let i = 0; i < steps && s.phase !== "IDLE_AT_DOCK"; i += 1) advance(s);
   }
   function snapshot(s) {
@@ -156,6 +165,8 @@
       current_location: s.current_location, battery_percent: s.battery_percent,
       queue: queued(s).map((o) => o.order_id), orders: s.orders, events: s.events,
       auto_paused: s.auto_paused,
+      emergency_stop: { ...s.emergency },
+      start: startStatus(s),
       tickets: s.tickets,
       restaurant: { tables: TABLES.map((id) => ({ id })) },
       execution_backend: { mode: "browser_demo", hardware_accessed: false },
@@ -201,10 +212,9 @@
     if (payload.drink != null && !order) {
       s.sequence += 1;
       order = { order_id: orderId, table_id: payload.table_id, drink: payload.drink, created_at: now(),
-        priority: 0, sequence: s.sequence, state: "QUEUED", mission_id: null, failure: null, completed_at: null };
+        priority: 0, sequence: s.sequence, state: payload.accepted === true ? "ACCEPTED" : "PENDING", mission_id: null, failure: null, completed_at: null };
       s.orders.push(order);
-      record(s, "ORDER_QUEUED", { order_id: order.order_id, table_id: order.table_id, drink: order.drink });
-      if (!s.active_order_id) { startNext(s); s.last_tick = Date.now(); }
+      record(s, "ORDER_RECEIVED", { order_id: order.order_id, table_id: order.table_id, drink: order.drink });
     }
     let ticket = s.tickets.find((t) => t.order_id === orderId) || null;
     if (!ticket && (items.length || payload.client_ref || payload.drink == null)) {
@@ -220,9 +230,11 @@
 
   function handle(s, path, payload) {
     s.tickets = s.tickets || [];
+    s.emergency = s.emergency || { active: false, at: null, order_id: null };
     tick(s);
     let result;
     const cancel = path.match(/^\/api\/orders\/([^/]+)\/cancel$/);
+    const decide = path.match(/^\/api\/orders\/([^/]+)\/(accept|reject)$/);
     const served = path.match(/^\/api\/tickets\/([^/]+)\/served$/);
     if (path === "/api/state") {
       result = snapshot(s);
@@ -244,6 +256,36 @@
         else { order.state = "CANCELED"; order.completed_at = now(); }
       }
       result = { order };
+    } else if (decide) {
+      const order = s.orders.find((o) => o.order_id === decodeURIComponent(decide[1]));
+      if (!order) throw new ApiError("unknown order", 404);
+      if (order.state !== "PENDING") throw new ApiError(`order is ${order.state}`, 409);
+      order.state = decide[2] === "accept" ? "ACCEPTED" : "REJECTED";
+      if (order.state === "REJECTED") order.completed_at = now();
+      record(s, decide[2] === "accept" ? "ORDER_ACCEPTED" : "ORDER_REJECTED", { order_id: order.order_id });
+      result = { order };
+    } else if (path === "/api/mission/start") {
+      const status = startStatus(s);
+      if (!status.ready) throw new ApiError(status.reason, 409);
+      const order = accepted(s)[0];
+      order.state = "QUEUED";
+      record(s, "ORDER_RELEASED", { order_id: order.order_id });
+      startNext(s);
+      s.last_tick = Date.now();
+      result = { order };
+    } else if (path === "/api/emergency-stop") {
+      if (!s.emergency.active) s.emergency = { active: true, at: now(), order_id: s.active_order_id };
+      record(s, "EMERGENCY_STOP");
+      const order = active(s);
+      if (order) {
+        record(s, "MISSION_FAILED", { order_id: order.order_id, failed_phase: s.phase, failure: "EMERGENCY_STOP" });
+        finish(s, order, "FAILED", `${s.phase}:EMERGENCY_STOP`);
+      }
+      result = { emergency_stop: { ...s.emergency }, order };
+    } else if (path === "/api/emergency-stop/reset") {
+      if (s.emergency.active) record(s, "EMERGENCY_STOP_RESET");
+      s.emergency = { active: false, at: null, order_id: null };
+      result = { emergency_stop: { ...s.emergency } };
     } else if (path === "/api/control") {
       s.auto_paused = payload.paused === true;
       result = { auto_paused: s.auto_paused };

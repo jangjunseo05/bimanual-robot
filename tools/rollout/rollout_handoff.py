@@ -97,6 +97,7 @@ CHASSIS_HOLD = {
 LEFT_5 = tuple(CHASSIS_HOLD)
 GRIP_OPEN = 40.0
 GRIP_CLOSED = 10.0
+DISTANCE_LOG_S = 5.0
 
 
 class DoneDetector:
@@ -109,6 +110,16 @@ class DoneDetector:
         self.t_open: float | None = None
         self.cup_released = self.retracted = False
         self.release_pose: dict[str, float] = {}
+        self.t_log = 0.0
+
+    def _log_distance(self, now: float, obs: dict) -> None:
+        """끝 감지가 안 날 때 어느 관절이 얼마나 벗어났는지 남긴다. 판정은 바꾸지 않는다."""
+        if now < self.t_log:
+            return
+        self.t_log = now + DISTANCE_LOG_S
+        off = {k.removeprefix("left_").removesuffix(".pos"): round(float(obs[k]) - CHASSIS_HOLD[k], 1) for k in LEFT_5}
+        print(f"[auto] 상판 적재 자세와 차이(허용 {self.tol:.0f}도) {off} "
+              f"left_gripper={float(obs['left_gripper.pos']):.1f} right_gripper={float(obs['right_gripper.pos']):.1f}")
 
     def _settled(self, now: float, obs: dict, pose: dict[str, float], tol: float) -> bool:
         if max(abs(float(obs[k]) - pose[k]) for k in LEFT_5) >= tol:
@@ -120,6 +131,7 @@ class DoneDetector:
 
     def update(self, now: float, obs: dict, action: dict | None = None) -> bool:
         if self.mode == "pour":
+            self._log_distance(now, obs)
             rg = float(obs["right_gripper.pos"])
             if rg > 20:
                 self.bottle_held = True
@@ -227,7 +239,7 @@ def pre_relax(ports: dict[str, str], margin: int) -> None:
 
 
 def make_pose_mover(target: dict[str, float], move_s: float, label: str = "물따르기 시작 자세",
-                    max_speed: float | None = None):
+                    max_speed: float | None = None, stop_event=None):
     from lerobot.utils.robot_utils import precise_sleep
 
     def _move(hw, duration_s: float = 3.0, fps: int = 50) -> None:
@@ -242,6 +254,11 @@ def make_pose_mover(target: dict[str, float], move_s: float, label: str = "물�
                 print(f"[end] {label}로 {dur:.1f}s 동안 이동 (가장 큰 차이 {biggest:.1f}도)")
             steps = max(int(dur * fps), 1)
             for i in range(1, steps + 1):
+                if stop_event is not None and stop_event.is_set():
+                    now = robot.get_observation()
+                    robot.send_action({k: float(now[k]) for k in start})
+                    print(f"[end] {label} 이동 중단 - 현재 위치에서 정지")
+                    return
                 t = i / steps
                 t = t * t * (3 - 2 * t)
                 robot.send_action({k: start[k] * (1 - t) + target[k] * t for k in start})
@@ -271,8 +288,12 @@ def load_start_pose(arg: str, grippers: bool) -> tuple[Path, dict[str, float]]:
     return path, pose
 
 
-def move_to_start_pose(robot, target: dict[str, float], move_s: float, max_speed: float, tol: float) -> bool:
-    """저장 자세로 부드럽게 옮긴다. 도착 후 tol도 넘게 벗어난 관절이 있으면 그 자리에 고정하고 False."""
+def move_to_start_pose(robot, target: dict[str, float], move_s: float, max_speed: float, tol: float,
+                       stop_event=None) -> bool:
+    """저장 자세로 부드럽게 옮긴다. 도착 후 tol도 넘게 벗어난 관절이 있으면 그 자리에 고정하고 False.
+
+    stop_event가 켜지면 이동을 끊고 그 자리에 고정한 뒤 False.
+    """
     from lerobot.utils.robot_utils import precise_sleep
 
     fps = 50
@@ -284,6 +305,11 @@ def move_to_start_pose(robot, target: dict[str, float], move_s: float, max_speed
         print(f"[start] 시작 자세로 {dur:.1f}s 동안 이동 (가장 큰 차이 {biggest:.1f}도)")
         steps = max(int(dur * fps), 1)
         for i in range(1, steps + 1):
+            if stop_event is not None and stop_event.is_set():
+                now = robot.get_observation()
+                robot.send_action({k: float(now[k]) for k in target})
+                print("[start] 시작 자세 이동 중단 - 그 자리에 멈추고 추론하지 않음")
+                return False
             t = i / steps
             t = t * t * (3 - 2 * t)
             robot.send_action({k: start[k] * (1 - t) + target[k] * t for k in start})

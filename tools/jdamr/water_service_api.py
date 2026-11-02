@@ -17,6 +17,7 @@ from pathlib import Path
 import secrets
 import signal
 import sys
+import threading
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -26,6 +27,7 @@ from water_service import WaterServiceController
 
 DEFAULT_STATE_DIRECTORY = Path.home() / ".local/state/bimanual-robot/water-service"
 MAX_BODY_BYTES = 4096
+FOLLOW_INTERVAL_S = 0.5
 
 
 def _read_or_create_token(path: Path) -> str:
@@ -178,6 +180,27 @@ class _MissionHandler(BaseHTTPRequestHandler):
         sys.stderr.write("water-service-api: " + format_string % arguments + "\n")
 
 
+def _follow_web(controller: WaterServiceController, done: threading.Event, dry_run: bool) -> None:
+    """Follow the control page: start the mission its Start asks for and stop on its STOP.
+
+    A lost link is only logged here.  A driving mission already stops itself when its own
+    order server reads fail, and nothing starts without a fresh read.
+    """
+    last_error = None
+    while not done.wait(FOLLOW_INTERVAL_S):
+        try:
+            action = controller.follow_web(controller.read_web_state(), dry_run=dry_run)
+            controller.report_web(dry_run=dry_run)
+        except (RuntimeError, ValueError) as error:
+            if str(error) != last_error:
+                print(f"water-service-api: follow: {error}", file=sys.stderr, flush=True)
+            last_error = str(error)
+            continue
+        last_error = None
+        if action:
+            print(f"water-service-api: follow: {action}", flush=True)
+
+
 def _client_request(url: str, token: str, action: str, request_id: str | None) -> int:
     path = "/api/mission/status" if action == "status" else f"/api/mission/{action}"
     payload = None
@@ -227,6 +250,10 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="run dock -> water station -> table 1 -> dock without Windows inference",
     )
+    serve.add_argument("--follow-web", action="store_true",
+                       help="start the mission when the control page Start folds the arms; stop on its STOP")
+    serve.add_argument("--follow-dry-run", action="store_true",
+                       help="with --follow-web: report what would happen; never start or stop anything")
     serve.add_argument("--map-session", type=Path)
     serve.add_argument("--allow-origin", help="one exact browser Origin allowed by CORS")
 
@@ -258,6 +285,12 @@ def main() -> int:
     server = _MissionServer(
         (arguments.host, arguments.port), controller, token, arguments.allow_origin
     )
+    follow_done = threading.Event()
+    if arguments.follow_web:
+        if arguments.navigation_only or not arguments.inference_url:
+            raise SystemExit("--follow-web needs --order-url and a mission with inference")
+        threading.Thread(target=_follow_web, args=(controller, follow_done, arguments.follow_dry_run),
+                         name="follow-web", daemon=True).start()
 
     def terminate(_signum: int, _frame: object) -> None:
         raise KeyboardInterrupt
@@ -268,6 +301,7 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        follow_done.set()
         controller.stop()
         server.server_close()
     return 0

@@ -445,6 +445,7 @@ class RolloutServiceBackend:
         self._lock = threading.Lock()
         self._aligned = threading.Event()
         self._cancel = threading.Event()
+        self._halted = threading.Event()
         self._waiting: dict | None = None
         self._running: str | None = None
         self._results: dict[tuple[str, str], dict] = {}
@@ -515,6 +516,10 @@ class RolloutServiceBackend:
         with self._lock:
             self._running = task
             self._cancel.clear()
+        if self._halted.is_set():
+            with self._lock:
+                self._running = None
+            return {"ok": False, "failure_code": "EMERGENCY_STOP"}
         try:
             # Right after scenario start the service may still be loading policies (409, state=loading): wait.
             deadline = time.monotonic() + self.run_timeout_s
@@ -567,6 +572,8 @@ class RolloutServiceBackend:
 
     def execute(self, command: dict, *, mission_id: str | None, phase_attempt: int) -> BackendResult:
         del phase_attempt
+        if self._halted.is_set():
+            return BackendResult(False, "EMERGENCY_STOP", self.mode)
         if command.get("kind") == "navigate":
             destination = str(command.get("destination") or "")
             with self._lock:
@@ -618,6 +625,28 @@ class RolloutServiceBackend:
             except OSError:
                 return False
         return False
+
+    def emergency_stop(self) -> bool:
+        """Hold every later arm command and stop the running one.
+
+        The second /stop catches a run request that was already on its way when the first one arrived.
+        """
+        import time
+
+        self._halted.set()
+        self._cancel.set()
+        sent = False
+        for delay_s in (0.0, 0.3):
+            time.sleep(delay_s)
+            try:
+                self._request("POST", "/stop", timeout=1.0)
+                sent = True
+            except OSError:
+                pass
+        return sent
+
+    def release_emergency_stop(self) -> None:
+        self._halted.clear()
 
     def info(self) -> dict:
         with self._lock:

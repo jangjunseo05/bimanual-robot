@@ -18,7 +18,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from src.mission.service_execution_backend import CommandBackend, ImmediateBackend, Ros2ManipulationBackend, Ros2PlannedArtifactBackend, Ros2PlannedRoundtripBackend, Ros2PlannedSessionBackend, RolloutServiceBackend
-from src.mission.service_mission_control import DryRunRuntime, MissionController
+from src.mission.service_mission_control import DryRunRuntime, MissionController, ORDER_STATES, OrderStateError
 from src.mission.service_order_store import ServiceOrderStore
 
 
@@ -42,13 +42,14 @@ STATIC_FILES = {
     "/api.js": (API_JS, "text/javascript"),
     "/config.js": (CONFIG_JS, "text/javascript"),
 }
-ORDER_PATH = re.compile(r"^/api/orders/([A-Za-z0-9._:-]{1,64})/cancel$")
+ORDER_PATH = re.compile(r"^/api/orders/([A-Za-z0-9._:-]{1,64})/(cancel|accept|reject)$")
 TICKET_PATH = re.compile(r"^/api/tickets/([A-Za-z0-9._:-]{1,64})/served$")
 # 메뉴 사진(static/menu/*.jpg), 관제 지도(static/map/*.png|json), 손님 화면 글꼴(static/fonts/*.woff)
 ASSET_PATH = re.compile(r"^/(menu|map|fonts)/([a-z0-9_]{1,40})\.(jpg|png|json|woff)$")
 ASSET_TYPES = {"jpg": "image/jpeg", "png": "image/png", "json": "application/json; charset=utf-8", "woff": "font/woff"}
 CLIENT_REF_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 ORDER_NO_DIGITS = 3  # 주문 번호 = YYMMDD + 일련번호 3자리 (예: 261027001)
+DRIVE_LINK_TIMEOUT_S = 3.0  # 주행 PC 보고가 이보다 오래 없으면 미연결로 표시한다
 
 
 def _trim(value, depth: int = 0):
@@ -158,6 +159,7 @@ class ServiceApplication:
                 persisted,
                 config=source.config,
                 layout=source.layout,
+                require_operator=source.require_operator,
                 clock=source.clock,
             )
         else:
@@ -167,6 +169,9 @@ class ServiceApplication:
         self.execution_lock = threading.Lock()
         self.last_backend_result: dict | None = None
         self.auto_paused = False
+        # 긴급 정지 잠금: 해제할 때까지 다음 단계와 Start를 막는다. 주행 쪽은 /api/state 로 읽는다.
+        self.emergency: dict = {"active": False, "at": None, "order_id": None}
+        self.drive_link: dict | None = None
         # 주문표: 주문 번호별 메뉴 줄(로봇 음료 + 직원이 가져다주는 음식). 로봇 미션은 음료만 맡는다.
         self.tickets: dict[str, dict] = self._load_tickets()
         self.pose_feed: RobotPoseFeed | None = None
@@ -272,6 +277,9 @@ class ServiceApplication:
             snapshot['simulator_accessed'] = snapshot['execution_backend'].get('simulator_accessed', False)
             snapshot["last_backend_result"] = self.last_backend_result
             snapshot["auto_paused"] = self.auto_paused
+            snapshot["emergency_stop"] = dict(self.emergency)
+            snapshot["start"] = self._start_status(snapshot["execution_backend"])
+            snapshot["drive_link"] = self._drive_link_status()
             snapshot["tickets"] = list(self.tickets.values())
             snapshot["robot_pose"] = self.pose_feed.pose if self.pose_feed is not None else None
             snapshot["robot_nav"] = self.pose_feed.nav if self.pose_feed is not None else None
@@ -285,6 +293,90 @@ class ServiceApplication:
             }
             return snapshot
 
+    def drive_heartbeat(self, payload: dict) -> dict:
+        """주행 PC가 관제를 따라가는 중임을 알린다. 표시용이며 미션을 바꾸지 않는다."""
+        with self.lock:
+            self.drive_link = {"received": time.monotonic(),
+                               **{k: payload.get(k) for k in ("state", "phase", "mission_id", "error", "dry_run")}}
+            return {"ok": True}
+
+    def _drive_link_status(self) -> dict:
+        if self.drive_link is None:
+            return {"connected": False}
+        age_s = time.monotonic() - self.drive_link["received"]
+        return {**{k: v for k, v in self.drive_link.items() if k != "received"},
+                "connected": age_s < DRIVE_LINK_TIMEOUT_S, "age_s": round(age_s, 1)}
+
+    def _start_status(self, backend_info: dict) -> dict:
+        """Whether the control page Start may run now, and the order it would release."""
+        accepted = self.controller.accepted_orders()
+        reason = None
+        if self.emergency["active"]:
+            reason = "emergency_stop"
+        elif self.controller.active_order is not None:
+            reason = "mission_running"
+        elif not accepted:
+            reason = "no_accepted_order"
+        elif backend_info.get("manipulation_service_state") not in (None, "ready"):
+            reason = "manipulation_not_ready"
+        return {"ready": reason is None, "reason": reason, "order_id": accepted[0].order_id if accepted else None}
+
+    def _operator_action(self, action, order_id: str) -> dict:
+        with self.lock:
+            order = action(order_id)
+            self._persist()
+            return {"order": order.__dict__, "state": self.controller.snapshot()}
+
+    def accept(self, order_id: str) -> dict:
+        return self._operator_action(self.controller.accept, order_id)
+
+    def _drop_staff_items(self, order_id: str) -> None:
+        """A refused or withdrawn order takes its food lines with it; staff should not serve them."""
+        ticket = self.tickets.get(order_id)
+        if ticket is not None and ticket["staff_state"] == "PREPARING":
+            ticket["staff_state"] = None
+            self._persist_tickets()
+
+    def reject(self, order_id: str) -> dict:
+        with self.lock:
+            result = self._operator_action(self.controller.reject, order_id)
+            self._drop_staff_items(order_id)
+            return result
+
+    def start_mission(self) -> dict:
+        """Control page Start: release the oldest accepted order so the mission begins."""
+        with self.lock:
+            status = self._start_status(self.backend.info())
+            if not status["ready"]:
+                raise OrderStateError(status["reason"])
+            order = self.controller.start_next()
+            self._persist()
+            return {"order": order.__dict__, "state": self.controller.snapshot()}
+
+    def emergency_stop(self) -> dict:
+        """Latch STOP first so nothing new can start, then stop the arms, then end the mission."""
+        with self.lock:
+            if not self.emergency["active"]:
+                self.emergency = {"active": True, "at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                                  "order_id": self.controller.active_order_id}
+        arm_stop_sent = getattr(self.backend, "emergency_stop", self.backend.cancel_active)()
+        with self.lock:
+            order = self.controller.emergency_stop()
+            self._persist()
+            return {"emergency_stop": dict(self.emergency), "arm_stop_sent": arm_stop_sent,
+                    "order": order.__dict__ if order else None, "state": self.controller.snapshot()}
+
+    def reset_emergency_stop(self) -> dict:
+        with self.lock:
+            if self.emergency["active"]:
+                self.emergency = {"active": False, "at": None, "order_id": None}
+                release = getattr(self.backend, "release_emergency_stop", None)
+                if release is not None:
+                    release()
+                self.controller.record_event("EMERGENCY_STOP_RESET")
+                self._persist()
+            return {"emergency_stop": dict(self.emergency), "state": self.controller.snapshot()}
+
     def set_auto_paused(self, paused: bool) -> dict:
         """Pause or resume automatic phase execution; a running backend command still finishes."""
         with self.lock:
@@ -294,16 +386,19 @@ class ServiceApplication:
     def _stats(self, snapshot: dict) -> dict:
         if self.store is not None:
             return self.store.stats()
-        counts = {state: 0 for state in ("QUEUED", "RUNNING", "SUCCEEDED", "FAILED", "CANCELED")}
+        counts = {state: 0 for state in ORDER_STATES}
         for order in snapshot["orders"]:
             counts[order["state"]] += 1
         return {
             "total": len(snapshot["orders"]),
+            "pending": counts["PENDING"],
+            "accepted": counts["ACCEPTED"],
             "queued": counts["QUEUED"],
             "running": counts["RUNNING"],
             "succeeded": counts["SUCCEEDED"],
             "failed": counts["FAILED"],
             "canceled": counts["CANCELED"],
+            "rejected": counts["REJECTED"],
             "events": len(snapshot["events"]),
             "commands": len(self.runtime.commands),
         }
@@ -402,6 +497,9 @@ class ServiceApplication:
                 if self.controller.active_order_id == order_id
                 else False
             )
+            existing = self.controller.orders.get(order_id)
+            if existing is not None and existing.state in {"PENDING", "ACCEPTED"}:
+                self._drop_staff_items(order_id)
             order = self.controller.cancel(order_id)
             self._persist()
             return {
@@ -417,6 +515,8 @@ class ServiceApplication:
             raise BackendBusyError("a backend command is already running")
         try:
             with self.lock:
+                if self.emergency["active"]:
+                    raise BackendBusyError("emergency stop is latched")
                 phase_before = self.controller.phase
                 order_before = self.controller.active_order_id
                 command = self.runtime.step(success=success, failure=failure)
@@ -441,6 +541,8 @@ class ServiceApplication:
             raise BackendBusyError("a backend command is already running")
         try:
             with self.lock:
+                if self.emergency["active"]:
+                    raise BackendBusyError("emergency stop is latched")
                 phase_before = self.controller.phase
                 order_before = self.controller.active_order_id
                 active_order = self.controller.active_order
@@ -520,12 +622,18 @@ def handler_factory(app: ServiceApplication, cors_origin: str | None = None) -> 
             self.send_header("Content-Length", "0")
             self.end_headers()
 
+        body_read = False
+
         def log_message(self, fmt: str, *args: Any) -> None:
             if urlparse(self.path).path == "/api/state":
                 return
             print(f"{self.address_string()} - {fmt % args}")
 
         def _json(self, status: int, payload: dict) -> None:
+            # 본문을 남긴 채 연결을 닫으면 Windows가 응답 전에 연결을 끊는다(WinError 10053)
+            length = self.headers.get("Content-Length") or ""
+            if not self.body_read and length.isdigit() and int(length) <= 16_384:
+                self.rfile.read(int(length))
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -544,6 +652,7 @@ def handler_factory(app: ServiceApplication, cors_origin: str | None = None) -> 
                 raise ValueError("Content-Length must be an integer") from exc
             if not 0 < length <= 16_384:
                 raise ValueError("request body must be 1-16384 bytes")
+            self.body_read = True
             try:
                 payload = json.loads(self.rfile.read(length))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -634,9 +743,22 @@ def handler_factory(app: ServiceApplication, cors_origin: str | None = None) -> 
                         raise ValueError("paused must be boolean")
                     self._json(HTTPStatus.OK, app.set_auto_paused(paused))
                     return
+                if path == "/api/drive/heartbeat":
+                    self._json(HTTPStatus.OK, app.drive_heartbeat(self._read_json()))
+                    return
+                if path == "/api/mission/start":
+                    self._json(HTTPStatus.OK, app.start_mission())
+                    return
+                if path == "/api/emergency-stop":
+                    self._json(HTTPStatus.OK, app.emergency_stop())
+                    return
+                if path == "/api/emergency-stop/reset":
+                    self._json(HTTPStatus.OK, app.reset_emergency_stop())
+                    return
                 match = ORDER_PATH.fullmatch(path)
                 if match:
-                    self._json(HTTPStatus.OK, app.cancel(match.group(1)))
+                    action = {"cancel": app.cancel, "accept": app.accept, "reject": app.reject}[match.group(2)]
+                    self._json(HTTPStatus.OK, action(match.group(1)))
                     return
                 match = TICKET_PATH.fullmatch(path)
                 if match:
@@ -649,6 +771,8 @@ def handler_factory(app: ServiceApplication, cors_origin: str | None = None) -> 
                 self._json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request", "detail": str(exc)})
             except BackendBusyError as exc:
                 self._json(HTTPStatus.CONFLICT, {"error": "backend_busy", "detail": str(exc)})
+            except OrderStateError as exc:
+                self._json(HTTPStatus.CONFLICT, {"error": "order_state_conflict", "detail": str(exc)})
 
     return Handler
 
@@ -688,6 +812,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--manipulation-timeout-s", type=float, default=30.0)
     parser.add_argument("--manip-url", default="http://127.0.0.1:8770",
                         help="rollout-service backend: address of tools/rollout/rollout_service.py")
+    parser.add_argument("--auto-dispatch", action="store_true",
+                        help="start a mission as soon as an order arrives (no operator accept or Start)")
     parser.add_argument("--no-align-confirm", action="store_true",
                         help="rollout-service backend: do not wait for the alignment-done signal before arm work")
     parser.add_argument("--accept-duration", action="store_true",
@@ -748,6 +874,7 @@ def main(argv: list[str] | None = None) -> int:
         MissionController(
             battery_percent=args.battery_percent,
             require_dock_return=args.backend == "ros2-planned-roundtrip",
+            require_operator=not args.auto_dispatch,
         ),
         args.state_dir,
         backend,

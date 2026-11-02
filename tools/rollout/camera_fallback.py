@@ -10,6 +10,7 @@ install()은 read_latest를 감싸서
 정상 프레임이 한 번도 없으면 원래대로 오류를 낸다.
 
 한계: 끊긴 동안 정책은 멈춘 화면을 본다. 짧은 끊김은 버티지만, 오래 끊기면 정책 판단이 틀릴 수 있다.
+카메라가 끝내 돌아오지 않아도 실행은 스스로 멈추지 않으니 그때는 STOP으로 끊는다.
 """
 from __future__ import annotations
 
@@ -70,6 +71,8 @@ def install(role_by_index: dict[int, str]) -> None:
         except Exception as e:  # noqa: BLE001
             _log(f"{cam} 다시 연결 실패({e}) - {RECONNECT_EVERY_S:.0f}초 뒤 재시도")
         finally:
+            # 연결이 끝난 시점부터 잰다. 시작 시점부터 재면 연결(1~2 s) 뒤 첫 프레임(0.3 s) 전에 다시 끊는다
+            cam._fb_next_try = time.monotonic() + RECONNECT_EVERY_S
             cam._fb_reconnecting = False
 
     def read_latest(self, max_age_ms: int = 500):
@@ -90,7 +93,6 @@ def install(role_by_index: dict[int, str]) -> None:
                 _log(f"{self}({self._fb_role}) 프레임 끊김({e}) - 마지막 프레임으로 계속, 다시 연결 시도")
             if not self._fb_reconnecting and now >= self._fb_next_try:
                 self._fb_reconnecting = True
-                self._fb_next_try = now + RECONNECT_EVERY_S
                 threading.Thread(target=reconnect, args=(self,), daemon=True, name=f"{self}_reconnect").start()
             return self._fb_last
         if self._fb_down_since is not None:
@@ -102,11 +104,11 @@ def install(role_by_index: dict[int, str]) -> None:
     read_latest._fallback_installed = True
     OpenCVCamera.read_latest = read_latest
 
-    # 카메라 하나가 다시 연결되는 1~2초 동안 로봇 전체가 "연결 안 됨"으로 판정돼 관측·명령이 거부되지 않게,
-    # 다시 연결 중인 카메라는 연결된 것으로 본다(그동안 read_latest는 마지막 프레임을 준다).
+    # 카메라 하나가 끊긴 동안 로봇 전체가 "연결 안 됨"으로 판정돼 관측·명령이 거부되지 않게,
+    # 복구될 때까지(다시 연결이 실패해 다음 시도를 기다리는 동안 포함) 연결된 것으로 본다(그동안 read_latest는 마지막 프레임을 준다).
     original_is_connected = OpenCVCamera.is_connected
 
     def is_connected(self) -> bool:
-        return bool(getattr(self, "_fb_reconnecting", False)) or original_is_connected.fget(self)
+        return getattr(self, "_fb_down_since", None) is not None or original_is_connected.fget(self)
 
     OpenCVCamera.is_connected = property(is_connected)

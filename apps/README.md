@@ -4,7 +4,7 @@
 |---|---|---|
 | service_order/ | 주문 API·주문/미션 화면 | `python3 -m apps.service_order.service_order_server --backend immediate --port 8765` |
 | service_order/ `/order` | 손님용 주문 화면(테이블·음료 선택, 진행 상황 확인, 대기 중 취소) | 위 서버 실행 뒤 `http://<주소>:8765/order?table=3` |
-| service_order/ `/control` | 운영자용 관제 화면(로봇 상태, 진행 단계, 대기열·취소, 일시정지, 대리 주문) | 위 서버 실행 뒤 `http://<주소>:8765/control` |
+| service_order/ `/control` | 운영자용 관제 화면(주문 수락·거절, START·STOP, 로봇 상태, 진행 단계, 일시정지, 대리 주문) | 위 서버 실행 뒤 `http://<주소>:8765/control` |
 | camera_dashboard/ | RGB 카메라 관제·요청에 따른 정지 | `python3 -m apps.camera_dashboard.camera_dashboard --help` |
 | project_site/ | 프로젝트 소개 소스 | 해당 폴더에서 `npm ci`, `npm run dev` |
 | ../src/navigation/dashboard/ | Pi 주행 telemetry 대시보드 | [배포 안내](../src/navigation/deployment/README.md) |
@@ -27,9 +27,17 @@ CPU immediate 주문 모드는 하드웨어를 움직이지 않는다. 주문 �
 
 - 손님용 `/order?table=N`: 테이블 QR에 이 주소를 넣으면 테이블 선택을 건너뛴다. 주문 뒤 주소에
   `order=<주문 번호>`가 붙어 새로고침해도 같은 주문을 계속 보여 준다. 취소는 대기 중일 때만 가능하다.
-- 운영자용 `/control`: 자동 진행 일시정지·재개(`POST /api/control {"paused": bool}`), 현재 주문 중단,
-  대기 주문 취소, 직원 대리 주문, 최근 주문·실패 원인, 이벤트 기록을 본다. dry-run 모드에서는
-  한 단계 진행·실패 주입 시험 도구가 보인다.
+- 운영자용 `/control`: 들어온 주문을 수락·거절하고, 수락한 주문을 START로 시작하며, STOP으로 긴급 정지한다.
+  직원 대리 주문은 수락된 상태로 들어간다. 자동 진행 일시정지·재개(`POST /api/control {"paused": bool}`),
+  최근 주문·실패 원인, 이벤트 기록도 본다. dry-run 모드에서는 한 단계 진행·실패 주입 시험 도구가 보인다.
+- 주문 상태: `PENDING`(수락 대기) → `ACCEPTED`(수락됨) → START → `QUEUED`·`RUNNING`, 거절은 `REJECTED`.
+  주문이 들어와도 START 전에는 팔이 움직이지 않는다. 예전처럼 주문 즉시 시작하려면 서버를 `--auto-dispatch`로 띄운다.
+- START는 수락한 주문 중 가장 오래된 것을 시작한다(`POST /api/mission/start`). 진행 중 미션, 긴급 정지,
+  조작 실행기 미준비 상태에서는 거절하며 이유는 `/api/state`의 `start`에 있다.
+- STOP(`POST /api/emergency-stop`)은 잠금을 먼저 걸고 조작 실행기에 `/stop`을 보낸 뒤 진행 주문을 `FAILED`로 끝낸다.
+  잠금은 [긴급 정지 해제](`POST /api/emergency-stop/reset`) 전까지 다음 단계와 START를 막는다.
+  상태는 `/api/state`의 `emergency_stop`이다. 차량 정지는 주행 PC 연동에 달려 있다. 물리 비상 정지 장치를 대신하지 않는다.
+- 주행 PC가 `--follow-web`으로 붙으면 START 뒤 자동 출발하고, 연결 상태가 제목 아래에 표시된다([사용법](../tools/jdamr/README.md)).
 - 일시정지는 다음 단계를 시작하지 않을 뿐이며, 진행 중인 단계는 끝까지 수행한다. 비상 정지 장치가 아니다.
 - 다른 기기(휴대폰)에서 접속하려면 `--host 0.0.0.0`으로 실행한다. 인증이 없으므로 같은 내부망에서만 쓴다.
 - 실물 팔 연동: `--backend rollout-service`는 조작 단계를 상주형 조작 실행기(`tools/rollout/rollout_service.py`)로 보낸다. 주방·테이블 정렬 단계에서 관제 화면의 [정렬 완료] 버튼(`POST /api/align/confirm`)을 기다린다. 한 번에 켜는 방법은 `tools/rollout/start_scenario.bat`, 상세는 [상주형 조작 실행기 문서](../docs/guides/20261026_상주형_조작실행기_사용법.md) 6절이다. 주문이 시작되면 출발 전에 양팔을 이동 자세(`place_end`)로 접고, `/api/state`의 `execution_backend.drive`로 다음 목적지와 출발 가능 여부를 알린다. 시연 절차는 [최종 시연 운영 절차](../docs/guides/20261029_최종시연_운영절차.md)다.

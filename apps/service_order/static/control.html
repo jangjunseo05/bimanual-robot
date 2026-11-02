@@ -3,13 +3,13 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="color-scheme" content="dark">
+  <meta name="color-scheme" content="light">
   <title>MS AMMR 로봇 관제</title>
   <style>
     :root {
-      --bg: #0b1220; --panel: #111a2c; --panel-2: #16223a; --line: #23324f; --ink: #e6edf7; --muted: #8fa0ba; --faint: #5d6e8a;
-      --accent: #4aa3ff; --accent-soft: rgba(74,163,255,.14); --ok: #3ccf8e; --ok-soft: rgba(60,207,142,.14);
-      --warn: #f5b84a; --warn-soft: rgba(245,184,74,.14); --danger: #ff6b6b; --danger-soft: rgba(255,107,107,.14);
+      --bg: #f4f6fa; --panel: #ffffff; --panel-2: #eef1f6; --line: #dbe1ea; --ink: #1a2433; --muted: #566478; --faint: #7d8ba0;
+      --accent: #1769c7; --accent-soft: rgba(23,105,199,.1); --ok: #0d8559; --ok-soft: rgba(13,133,89,.12);
+      --warn: #a86400; --warn-soft: rgba(168,100,0,.12); --danger: #cf2338; --danger-soft: rgba(207,35,56,.1);
       --mono: "JetBrains Mono", "Cascadia Code", Consolas, "D2Coding", monospace;
       --radius: 10px;
       font-family: Pretendard, "Noto Sans KR", "Apple SD Gothic Neo", "Malgun Gothic", system-ui, sans-serif;
@@ -22,7 +22,7 @@
     button:disabled { cursor: not-allowed; opacity: .45; }
     button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     main { width: min(1480px, 100%); margin: 0 auto; padding: 14px 16px 40px; }
-    header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; }
+    header { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px; margin: -14px -16px 12px; padding: 10px 16px; background: var(--panel); border-bottom: 1px solid var(--line); }
     .title { display: flex; align-items: center; gap: 10px; }
     .logo { width: 34px; height: 34px; border-radius: 9px; display: grid; place-items: center; background: var(--accent-soft); color: var(--accent); }
     h1 { margin: 0; font-size: 18px; letter-spacing: -.01em; }
@@ -31,14 +31,21 @@
     .conn.bad { color: var(--danger); font-weight: 700; }
     .btn { padding: 7px 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-2); font-weight: 600; }
     .btn:hover:not(:disabled) { border-color: var(--accent); }
-    .btn.primary { background: var(--accent); border-color: var(--accent); color: #06111f; }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
     .btn.danger { background: transparent; border-color: var(--danger); color: var(--danger); }
     .btn.small { padding: 3px 9px; font-size: 12px; }
-    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .btn.start, .btn.stop { min-width: 112px; padding: 10px 20px; border: 0; color: #fff; font-size: 15px; font-weight: 800; letter-spacing: .04em; }
+    .btn.start { background: var(--ok); }
+    .btn.stop { background: var(--danger); }
+    .btn.stop:hover:not(:disabled) { background: #a81829; }
+    .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+    .run-hint { color: var(--muted); font-size: 12px; }
+    .row-actions { display: flex; gap: 6px; }
     .banner { margin-bottom: 10px; padding: 9px 12px; border-radius: var(--radius); border: 1px solid; font-weight: 600; }
-    .banner.demo { border-color: rgba(245,184,74,.4); background: var(--warn-soft); color: var(--warn); }
-    .banner.warn { border-color: rgba(245,184,74,.4); background: var(--warn-soft); color: var(--warn); }
-    .banner.align { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; border-color: rgba(74,163,255,.45); background: var(--accent-soft); color: var(--accent); }
+    .banner.demo { border-color: rgba(168,100,0,.4); background: var(--warn-soft); color: var(--warn); }
+    .banner.warn { border-color: rgba(168,100,0,.4); background: var(--warn-soft); color: var(--warn); }
+    .banner.align { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; border-color: rgba(23,105,199,.45); background: var(--accent-soft); color: var(--accent); }
+    .banner.estop { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; border-color: var(--danger); background: var(--danger-soft); color: var(--danger); }
 
     /* 상태 칩 */
     .kpis { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; margin-bottom: 10px; }
@@ -57,10 +64,10 @@
     .card { padding: 12px 14px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); min-width: 0; }
     .card-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 10px; }
     .tag { padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 700; font-family: var(--mono); border: 1px solid var(--line); color: var(--muted); }
-    .tag.ok { color: var(--ok); border-color: rgba(60,207,142,.4); }
-    .tag.warn { color: var(--warn); border-color: rgba(245,184,74,.4); }
-    .tag.bad { color: var(--danger); border-color: rgba(255,107,107,.4); }
-    .tag.run { color: var(--accent); border-color: rgba(74,163,255,.45); }
+    .tag.ok { color: var(--ok); border-color: rgba(13,133,89,.4); }
+    .tag.warn { color: var(--warn); border-color: rgba(168,100,0,.4); }
+    .tag.bad { color: var(--danger); border-color: rgba(207,35,56,.4); }
+    .tag.run { color: var(--accent); border-color: rgba(23,105,199,.45); }
     .muted { color: var(--muted); }
     .mono { font-family: var(--mono); }
 
@@ -72,14 +79,14 @@
     .ph b { display: block; font-size: 10px; font-family: var(--mono); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .ph span { display: block; font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .ph i { display: block; font-style: normal; font-family: var(--mono); font-size: 11px; color: var(--faint); }
-    .ph.done { border-color: rgba(60,207,142,.35); }
+    .ph.done { border-color: rgba(13,133,89,.35); }
     .ph.done b, .ph.done i { color: var(--ok); }
     .ph.now { border-color: var(--accent); background: var(--accent-soft); }
     .ph.now b, .ph.now span, .ph.now i { color: var(--accent); }
     .ph.fail { border-color: var(--danger); background: var(--danger-soft); }
     .ph .layer { position: absolute; top: -7px; left: 50%; transform: translateX(-50%); padding: 0 5px; border-radius: 4px; font-size: 9px; font-weight: 800; background: var(--bg); }
-    .layer.nav { color: #7dd3fc; } .layer.manip { color: #c4b5fd; }
-    .cmd { margin: 10px 0 0; padding: 8px 10px; border-radius: 6px; background: #070d18; border: 1px solid var(--line); font-family: var(--mono); font-size: 11.5px; color: #b6c6dd; white-space: pre-wrap; word-break: break-all; max-height: 130px; overflow: auto; }
+    .layer.nav { color: #0a6e96; } .layer.manip { color: #6a46c2; }
+    .cmd { margin: 10px 0 0; padding: 8px 10px; border-radius: 6px; background: var(--panel-2); border: 1px solid var(--line); font-family: var(--mono); font-size: 11.5px; color: var(--ink); white-space: pre-wrap; word-break: break-all; max-height: 130px; overflow: auto; }
 
     table { width: 100%; border-collapse: collapse; }
     th, td { padding: 6px 6px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; }
@@ -92,7 +99,10 @@
     .st { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11.5px; font-weight: 700; }
     .st.ok { color: var(--ok); } .st.warn { color: var(--warn); } .st.bad { color: var(--danger); } .st.off { color: var(--faint); }
     .badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 700; font-family: var(--mono); }
-    .badge.QUEUED { background: var(--warn-soft); color: var(--warn); }
+    .badge.PENDING { background: var(--warn-soft); color: var(--warn); }
+    .badge.ACCEPTED { background: var(--ok-soft); color: var(--ok); }
+    .badge.REJECTED { background: var(--panel-2); color: var(--muted); }
+    .badge.QUEUED { background: var(--accent-soft); color: var(--accent); }
     .badge.RUNNING { background: var(--accent-soft); color: var(--accent); }
     .badge.SUCCEEDED { background: var(--ok-soft); color: var(--ok); }
     .badge.FAILED { background: var(--danger-soft); color: var(--danger); }
@@ -112,7 +122,7 @@
     .kv.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 
     .log { max-height: 260px; overflow: auto; margin: 0; padding: 0; list-style: none; font-family: var(--mono); font-size: 11.5px; }
-    .log li { padding: 3px 0; border-bottom: 1px dashed var(--line); color: #b6c6dd; }
+    .log li { padding: 3px 0; border-bottom: 1px dashed var(--line); color: var(--muted); }
     .log li .t { color: var(--faint); margin-right: 8px; }
     .log li .k { color: var(--accent); margin-right: 6px; }
     .log li.fail .k { color: var(--danger); }
@@ -137,15 +147,21 @@
       </div>
       <div>
         <h1>MS AMMR · 로봇 운영 콘솔</h1>
-        <div class="sub"><span id="conn" class="conn">connecting…</span> · <span id="srv"></span></div>
+        <div class="sub"><span id="conn" class="conn">connecting…</span> · <span id="srv"></span> · <span id="drive-link" class="conn"></span></div>
       </div>
     </div>
     <div class="actions">
+      <span class="run-hint" id="start-hint"></span>
       <button type="button" class="btn" id="pause">자동 진행 일시정지</button>
-      <button type="button" class="btn danger" id="abort" disabled>현재 미션 중단</button>
+      <button type="button" class="btn start" id="start" disabled>START</button>
+      <button type="button" class="btn stop" id="stop">STOP</button>
     </div>
   </header>
 
+  <div class="banner estop" id="estop-banner" hidden>
+    <span id="estop-text"></span>
+    <button type="button" class="btn" id="estop-reset">긴급 정지 해제</button>
+  </div>
   <div class="banner demo" id="demo-note" hidden>DEMO · 브라우저 안 시뮬레이션입니다. 토픽·조작·위치 값은 실제 로봇 값이 아닌 데모 값이며 화면에 DEMO로 표시합니다.</div>
   <div class="banner align" id="align-banner" hidden>
     <span id="align-text"></span>
@@ -164,6 +180,14 @@
 
   <div class="grid">
     <div class="col">
+      <section class="card">
+        <div class="card-head"><h2>주문 목록 <span class="muted" id="queue-count"></span></h2><span class="tag">수락 → START</span></div>
+        <div class="table-wrap"><table>
+          <thead><tr><th>주문 번호</th><th>테이블</th><th>메뉴</th><th>접수</th><th>상태</th><th></th></tr></thead>
+          <tbody id="queue"></tbody>
+        </table></div>
+      </section>
+
       <section class="card">
         <div class="card-head"><h2>Mission state machine</h2><span class="tag" id="fsm-tag">IDLE</span></div>
         <div class="current-head" id="current-head"></div>
@@ -189,12 +213,7 @@
       </section>
 
       <section class="card">
-        <div class="card-head"><h2>Job queue <span class="muted" id="queue-count"></span></h2><span class="tag">FIFO · priority</span></div>
-        <div class="table-wrap"><table>
-          <thead><tr><th>#</th><th>Job (order)</th><th>Target</th><th>Payload</th><th>Queued</th><th></th></tr></thead>
-          <tbody id="queue"></tbody>
-        </table></div>
-        <h2 style="margin:14px 0 8px">Recent missions</h2>
+        <div class="card-head"><h2>Recent missions</h2></div>
         <div class="table-wrap"><table>
           <thead><tr><th>Job (order)</th><th>Target</th><th>Payload</th><th>Result</th><th>Finished</th><th>Failure</th></tr></thead>
           <tbody id="history"></tbody>

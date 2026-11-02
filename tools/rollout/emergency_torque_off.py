@@ -19,8 +19,8 @@ CALIB_DIR = Path(__file__).resolve().parents[2] / "calibration" / "bi_follower"
 cfg = BiSOFollowerConfig(
     id="arms",
     calibration_dir=CALIB_DIR,
-    left_arm_config=SOFollowerConfig(port="COM15", disable_torque_on_disconnect=True),
-    right_arm_config=SOFollowerConfig(port="COM16", disable_torque_on_disconnect=True),
+    left_arm_config=SOFollowerConfig(port="COM3", disable_torque_on_disconnect=True),
+    right_arm_config=SOFollowerConfig(port="COM4", disable_torque_on_disconnect=True),
 )
 robot = BiSOFollower(cfg)
 robot.connect(calibrate=False)

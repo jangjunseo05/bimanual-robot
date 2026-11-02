@@ -60,6 +60,7 @@ class WaterServiceController:
         self._process: subprocess.Popen[str] | None = None
         self._log_path: Path | None = None
         self._state = self._load_state()
+        self._announced: set[str] = set()
         if self._state.get("state") == "running":
             self._state.update(
                 state="failed",
@@ -183,6 +184,55 @@ class WaterServiceController:
                 self._state["stop_errors"] = errors
                 self._save_state()
             return self.status()
+
+    def read_web_state(self) -> dict[str, Any]:
+        return self._http_json("GET", "/api/state", timeout_s=2.0)
+
+    def report_web(self, *, dry_run: bool) -> None:
+        """Tell the control page that this PC follows it and what the mission is doing."""
+        with self._lock:
+            body = {key: self._state.get(key) for key in ("state", "phase", "mission_id", "error")}
+        self._http_json("POST", "/api/drive/heartbeat", timeout_s=2.0, body={**body, "dry_run": dry_run})
+
+    def follow_web(self, state: dict[str, Any], *, dry_run: bool = False) -> str | None:
+        """Act once on the order server state: STOP first, otherwise depart for a newly started order.
+
+        The arms-ready kitchen request is the departure signal, so nothing moves before the
+        control page Start has folded the arms.  With dry_run only the decision is reported.
+        """
+        with self._lock:
+            running = self._worker_thread is not None and self._worker_thread.is_alive()
+        emergency = state.get("emergency_stop") or {}
+        if emergency.get("active"):
+            if dry_run:
+                return self._announce_once(f"stop-{emergency.get('at')}", "would_stop")
+            if running:
+                self.stop()
+                return "stop"
+            return None
+        if running:
+            return None
+        backend = state.get("execution_backend") or {}
+        drive = backend.get("drive") or {}
+        waiting = backend.get("waiting_alignment") or {}
+        order_id = waiting.get("order_id")
+        if (not order_id or waiting.get("station") != "kitchen" or drive.get("next") != "kitchen"
+                or drive.get("arms_ready") is not True):
+            return None
+        request_id = f"web-{order_id}"
+        if dry_run:
+            return self._announce_once(request_id, f"would_start {order_id}")
+        with self._lock:
+            if request_id in self._state.setdefault("requests", {}):
+                return None
+        self.start(request_id)
+        return f"start {order_id}"
+
+    def _announce_once(self, key: str, message: str) -> str | None:
+        if key in self._announced:
+            return None
+        self._announced.add(key)
+        return message
 
     def _run_mission(self, mission_dir: Path) -> None:
         try:
@@ -448,6 +498,8 @@ class WaterServiceController:
             self._save_state()
 
     def _drive_ready(self, state: dict[str, Any], destination: str) -> bool:
+        if (state.get("emergency_stop") or {}).get("active"):
+            raise RuntimeError("emergency stop is active on the order server")
         backend = state.get("execution_backend") or {}
         drive = backend.get("drive") or {}
         order_id = self._state.get("order_id")

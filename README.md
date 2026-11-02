@@ -91,6 +91,7 @@ python3 tools/jdamr/water_service_api.py stop
 | Pi 설치·배포·실차 운영 | [주행 사용법](tools/jdamr/README.md), [런타임 구성](docs/guides/JDAMR_RUNTIME.md) |
 | Astra RGB-D 전송·시각 동기화 | [AST1 송수신 계약](tools/jdamr/ASTRA_TCP.md) |
 | 지도·급수대·테이블·도크 좌표 | [강의실 지도와 위치](config/navigation/maps/classroom/README.md) |
+| 로봇 구동(세팅·실행·복구) | [로봇 구동 런북](docs/guides/20261031_로봇구동_런북.md) |
 | Windows 환경·장치 이전 | [새 노트북 인계](docs/guides/20261030_새노트북_작업인계.md) |
 | 주문·주행·조작 API 순서 | [통합 구현 명세](docs/guides/20261029_주행_조작_연동_구현명세.md) |
 | 팔 보정·모델·데이터 | [보정](calibration/README.md), [데이터 인덱스](data/README.md) |

@@ -15,7 +15,13 @@ const PHASE_LABEL = Object.fromEntries([
   ["IDLE_AT_DOCK", "충전소 대기"], ["NAVIGATE_DOCK", "충전소 복귀"],
   ["CHARGING", "충전 중"], ["TERMINAL_HOLD", "정지 대기"],
 ]);
-const STATE_LABEL = { QUEUED: "대기", RUNNING: "진행 중", SUCCEEDED: "완료", FAILED: "실패", CANCELED: "취소" };
+const STATE_LABEL = { PENDING: "수락 대기", ACCEPTED: "수락됨", QUEUED: "출발 대기", RUNNING: "진행 중", SUCCEEDED: "완료", FAILED: "실패", CANCELED: "취소", REJECTED: "거절" };
+const START_HINT = {
+  emergency_stop: "긴급 정지 상태입니다",
+  mission_running: "진행 중인 미션이 있습니다",
+  no_accepted_order: "수락한 주문이 없습니다",
+  manipulation_not_ready: "조작 실행기가 준비되지 않았습니다",
+};
 const DRINKS = { COLD_WATER: "냉수", HOT_WATER: "온수", LEMONADE: "레몬에이드", COLA: "콜라" };
 // 파이 주행 대시보드(ammr_dashboard)가 구독하는 토픽과 스냅샷 안의 위치
 const TOPICS = [
@@ -223,7 +229,7 @@ function render() {
   $("pause").textContent = state.auto_paused ? "자동 진행 재개" : "자동 진행 일시정지";
   $("pause").className = state.auto_paused ? "btn primary" : "btn";
   $("paused-banner").hidden = !state.auto_paused;
-  $("abort").disabled = !active;
+  renderRunControls();
   $("test-tools").hidden = !sim;
   $("t-reset").hidden = mode !== "browser_demo";
 
@@ -234,6 +240,23 @@ function render() {
   renderStaff();
   renderPoseKv();
   drawMap(active);
+}
+
+function renderRunControls() {
+  const start = state.start || {};
+  $("start").disabled = !start.ready;
+  const link = state.drive_link;
+  $("drive-link").textContent = !link ? "" : !link.connected ? "주행 PC 미연결"
+    : `주행 PC 연결 · ${link.dry_run ? "감지만 · " : ""}${link.phase || link.state || "-"}${link.error ? ` · ${link.error.slice(0, 80)}` : ""}`;
+  $("drive-link").className = link && !link.connected ? "conn bad" : "conn";
+  const noDrive = link && !link.connected ? " · 주행 PC 미연결: 차는 출발하지 않습니다" : "";
+  $("start-hint").textContent = start.ready ? `START: 주문 ${no(start.order_id)}${noDrive}` : START_HINT[start.reason] || start.reason || "";
+  const stop = state.emergency_stop || {};
+  $("estop-banner").hidden = !stop.active;
+  if (stop.active) {
+    const order = stop.order_id ? ` · 주문 ${no(stop.order_id)} 중단` : "";
+    $("estop-text").textContent = `긴급 정지 ${time(stop.at)}${order}. 다음 단계와 START를 막고 있습니다. 로봇과 팔 상태를 직접 확인한 뒤 해제하세요.`;
+  }
 }
 
 function phaseDurations(active) {
@@ -379,17 +402,40 @@ function renderCommands() {
   $("commands").replaceChildren(...(rows.length ? rows : [emptyRow("아직 실행된 명령이 없습니다.", 6)]));
 }
 
+function orderButton(label, className, handler) {
+  const button = el("button", label, `btn small ${className}`);
+  button.type = "button";
+  button.addEventListener("click", handler);
+  return button;
+}
+
+function orderActions(o) {
+  const box = el("div", undefined, "row-actions");
+  const id = o.order_id;
+  if (o.state === "PENDING") {
+    box.append(
+      orderButton("수락", "primary", () => act(() => api(`/api/orders/${encodeURIComponent(id)}/accept`, {}))),
+      orderButton("거절", "danger", () => {
+        if (confirm(`주문 ${no(id)}을(를) 거절할까요?`)) act(() => api(`/api/orders/${encodeURIComponent(id)}/reject`, {}));
+      }),
+    );
+  } else if (o.state === "ACCEPTED") {
+    box.append(orderButton("취소", "", () => cancelOrder(id)));
+  }
+  return box;
+}
+
 function renderJobs(orders, tickets) {
-  $("queue-count").textContent = state.queue.length ? `${state.queue.length}` : "";
-  const queueRows = state.queue.map((id, i) => {
-    const o = orders.get(id);
-    const cancel = el("button", "취소", "btn small");
-    cancel.type = "button";
-    cancel.addEventListener("click", () => cancelOrder(id));
-    return row([String(i + 1), el("span", no(id), "mono"), `${o.table_id} (${place(o.table_id)})`, payload(o), time(o.created_at), cancel]);
+  const open = state.orders.filter((o) => ["PENDING", "ACCEPTED", "QUEUED", "RUNNING"].includes(o.state));
+  const pending = open.filter((o) => o.state === "PENDING").length;
+  $("queue-count").textContent = pending ? `· 수락 대기 ${pending}건` : "";
+  const queueRows = open.map((o) => {
+    const food = itemsText(tickets.get(o.order_id));
+    return row([el("span", no(o.order_id), "mono"), place(o.table_id), `${payload(o)}${food ? ` + ${food}` : ""}`,
+      time(o.created_at), badge(o.state), orderActions(o)]);
   });
-  $("queue").replaceChildren(...(queueRows.length ? queueRows : [emptyRow("대기 중인 미션이 없습니다.", 6)]));
-  const done = state.orders.filter((o) => ["SUCCEEDED", "FAILED", "CANCELED"].includes(o.state)).reverse().slice(0, 8);
+  $("queue").replaceChildren(...(queueRows.length ? queueRows : [emptyRow("들어온 주문이 없습니다.", 6)]));
+  const done = state.orders.filter((o) => ["SUCCEEDED", "FAILED", "CANCELED", "REJECTED"].includes(o.state)).reverse().slice(0, 8);
   $("history").replaceChildren(...(done.length
     ? done.map((o) => row([el("span", no(o.order_id), "mono"), `${o.table_id} (${place(o.table_id)})`, payload(o), badge(o.state), time(o.completed_at), failureText(o.failure)]))
     : [emptyRow("아직 끝난 미션이 없습니다.", 6)]));
@@ -444,15 +490,22 @@ $("align-confirm").addEventListener("click", () => {
   }
 });
 $("pause").addEventListener("click", () => act(() => api("/api/control", { paused: !state?.auto_paused })));
-$("abort").addEventListener("click", () => {
-  const id = state?.active_order_id;
-  if (id && confirm(`진행 중인 미션 ${no(id)}을(를) 중단할까요?\n로봇은 다음 미션 또는 충전소 복귀로 넘어갑니다.`)) {
-    act(() => api(`/api/orders/${encodeURIComponent(id)}/cancel`, {}));
+$("start").addEventListener("click", () => {
+  const id = state?.start?.order_id;
+  if (id && confirm(`주문 ${no(id)}을(를) 시작할까요?\n팔이 접히고 전체 시나리오가 시작됩니다.`)) {
+    act(() => api("/api/mission/start", {}));
+  }
+});
+// 긴급 정지는 확인 창 없이 바로 보낸다.
+$("stop").addEventListener("click", () => act(() => api("/api/emergency-stop", {})));
+$("estop-reset").addEventListener("click", () => {
+  if (confirm("로봇과 팔 상태를 직접 확인했나요?\n해제해도 로봇은 스스로 움직이지 않습니다. 다음 주문은 START를 눌러야 시작됩니다.")) {
+    act(() => api("/api/emergency-stop/reset", {}));
   }
 });
 $("f-submit").addEventListener("click", () => act(async () => {
   // 주문 번호(YYMMDDNNN)는 서버가 붙인다.
-  const order = { table_id: $("f-table").value, drink: $("f-drink").value };
+  const order = { table_id: $("f-table").value, drink: $("f-drink").value, accepted: true };
   const result = await api("/api/orders", order);
   $("f-msg").textContent = `job ${result.order.order_id} · ${order.table_id} · ${order.drink} 등록`;
 }));

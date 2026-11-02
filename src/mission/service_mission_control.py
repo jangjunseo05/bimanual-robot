@@ -23,7 +23,9 @@ DEFAULT_CONFIG = ROOT / "config/simulation/service_mission_control.json"
 DEFAULT_ORDERS = ROOT / "config/simulation/service_orders_demo.json"
 DEFAULT_LAYOUT = ROOT / "config/simulation/restaurant_layout.json"
 
-ORDER_STATES = {"QUEUED", "RUNNING", "SUCCEEDED", "FAILED", "CANCELED"}
+# PENDING(손님 주문, 운영자 확인 전) -> ACCEPTED(수락, Start 대기) -> QUEUED(Start로 출발 허용) -> RUNNING
+ORDER_STATES = {"PENDING", "ACCEPTED", "QUEUED", "RUNNING", "SUCCEEDED", "FAILED", "CANCELED", "REJECTED"}
+TERMINAL_ORDER_STATES = {"SUCCEEDED", "FAILED", "CANCELED", "REJECTED"}
 # 로봇이 반드시 다룰 수 있어야 하는 기본 음료. config 의 supported_drinks 에 다른 병 음료를 더할 수 있다.
 DRINKS = {"COLD_WATER", "HOT_WATER"}
 ORDER_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
@@ -133,6 +135,10 @@ def load_control_config(path: Path = DEFAULT_CONFIG) -> dict:
     return config
 
 
+class OrderStateError(RuntimeError):
+    """The operator action does not fit the current order or mission state."""
+
+
 @dataclass
 class ServiceOrder:
     order_id: str
@@ -157,14 +163,18 @@ class MissionController:
         layout: dict | None = None,
         battery_percent: float = 100.0,
         require_dock_return: bool = False,
+        require_operator: bool = False,
         clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         if not isinstance(require_dock_return, bool):
             raise ValueError("require_dock_return must be boolean")
+        if not isinstance(require_operator, bool):
+            raise ValueError("require_operator must be boolean")
         self.config = config if config is not None else load_control_config()
         self.layout = layout if layout is not None else load_layout()
         self.clock = clock
         self.require_dock_return = require_dock_return
+        self.require_operator = require_operator
         self.table_ids = {table["id"] for table in self.layout["tables"]}
         self.orders: dict[str, ServiceOrder] = {}
         self.sequence = 0
@@ -186,6 +196,7 @@ class MissionController:
         *,
         config: dict | None = None,
         layout: dict | None = None,
+        require_operator: bool = False,
         clock: Callable[[], datetime] = _utc_now,
     ) -> "MissionController":
         """Restore a validated controller snapshot after a server restart."""
@@ -196,6 +207,7 @@ class MissionController:
             config=config,
             layout=layout,
             battery_percent=battery_percent,
+            require_operator=require_operator,
             clock=clock,
         )
         raw_orders = snapshot.get("orders")
@@ -324,6 +336,11 @@ class MissionController:
             return existing, False
         order = self._validate_new_order(payload)
         self.orders[order.order_id] = order
+        if self.require_operator:
+            # 로봇은 운영자의 수락과 Start 뒤에만 움직인다. 운영자가 직접 넣은 주문은 수락된 채로 들어온다.
+            order.state = "ACCEPTED" if payload.get("accepted") is True else "PENDING"
+            self._record("ORDER_RECEIVED", order_id=order.order_id, table_id=order.table_id, drink=order.drink)
+            return order, True
         self._record("ORDER_QUEUED", order_id=order.order_id, table_id=order.table_id, drink=order.drink)
         if self.phase == "IDLE_AT_DOCK" and self.active_order is None:
             self._dispatch_or_charge()
@@ -335,7 +352,7 @@ class MissionController:
         if order_id not in self.orders:
             raise KeyError(order_id)
         order = self.orders[order_id]
-        if order.state in {"SUCCEEDED", "FAILED", "CANCELED"}:
+        if order.state in TERMINAL_ORDER_STATES:
             return order
         order.state = "CANCELED"
         order.completed_at = _iso(self.clock())
@@ -349,6 +366,81 @@ class MissionController:
             else:
                 self._decide_after_terminal_order()
         return order
+
+    def _operator_order(self, order_id: str, allowed: set[str]) -> ServiceOrder:
+        if order_id not in self.orders:
+            raise KeyError(order_id)
+        order = self.orders[order_id]
+        if order.state not in allowed:
+            raise OrderStateError(f"order {order_id} is {order.state}")
+        return order
+
+    def accept(self, order_id: str) -> ServiceOrder:
+        order = self._operator_order(order_id, {"PENDING", "ACCEPTED"})
+        if order.state == "PENDING":
+            order.state = "ACCEPTED"
+            self._record("ORDER_ACCEPTED", order_id=order_id)
+        return order
+
+    def reject(self, order_id: str) -> ServiceOrder:
+        order = self._operator_order(order_id, {"PENDING", "REJECTED"})
+        if order.state == "PENDING":
+            order.state = "REJECTED"
+            order.completed_at = _iso(self.clock())
+            self._record("ORDER_REJECTED", order_id=order_id)
+        return order
+
+    def accepted_orders(self) -> list[ServiceOrder]:
+        return sorted(
+            (order for order in self.orders.values() if order.state == "ACCEPTED"),
+            key=lambda order: (-order.priority, order.created_at, order.sequence),
+        )
+
+    def start_next(self) -> ServiceOrder:
+        """Operator Start: release the oldest accepted order to the dispatcher."""
+        if self.active_order is not None:
+            raise OrderStateError("a mission is already running")
+        accepted = self.accepted_orders()
+        if not accepted:
+            raise OrderStateError("no accepted order")
+        order = accepted[0]
+        order.state = "QUEUED"
+        self._record("ORDER_RELEASED", order_id=order.order_id)
+        if self.phase == "IDLE_AT_DOCK":
+            self._dispatch_or_charge()
+        elif self.phase == "NAVIGATE_DOCK" and self._can_dispatch(order):
+            self._start_order(order)
+        return order
+
+    def emergency_stop(self) -> ServiceOrder | None:
+        """Operator STOP: end the active mission; released orders go back behind the Start button."""
+        for order in self._queued():
+            order.state = "ACCEPTED"
+        self._record("EMERGENCY_STOP")
+        order = self.active_order
+        if order is None:
+            return None
+        self._fail_order(order, self.phase, "EMERGENCY_STOP")
+        self._end_after_failure()
+        return order
+
+    def record_event(self, kind: str) -> None:
+        self._record(kind)
+
+    def _fail_order(self, order: ServiceOrder, phase: str, reason: str) -> None:
+        order.state = "FAILED"
+        order.failure = f"{phase}:{reason}"
+        order.completed_at = _iso(self.clock())
+        self._record("MISSION_FAILED", order_id=order.order_id, failed_phase=phase, failure=reason)
+        self.active_order_id = None
+
+    def _end_after_failure(self) -> None:
+        if self.require_dock_return:
+            self.phase = "TERMINAL_HOLD"
+            self.phase_attempt = 0
+            self._record("ROUNDTRIP_TERMINAL_HOLD", outcome="FAILED")
+        else:
+            self._decide_after_terminal_order()
 
     def _queued(self) -> list[ServiceOrder]:
         return sorted(
@@ -494,20 +586,10 @@ class MissionController:
                 return command
             order = self.active_order
             if order is not None:
-                order.state = "FAILED"
-                order.failure = f"{phase_before}:{reason}"
-                order.completed_at = _iso(self.clock())
-                self._record("MISSION_FAILED", order_id=order.order_id, failed_phase=phase_before,
-                             failure=reason)
-                self.active_order_id = None
+                self._fail_order(order, phase_before, reason)
             else:
                 self._record("SYSTEM_PHASE_FAILED", failed_phase=phase_before, failure=reason)
-            if self.require_dock_return:
-                self.phase = "TERMINAL_HOLD"
-                self.phase_attempt = 0
-                self._record("ROUNDTRIP_TERMINAL_HOLD", outcome="FAILED")
-            else:
-                self._decide_after_terminal_order()
+            self._end_after_failure()
             return command
 
         self._consume_for_command(command)

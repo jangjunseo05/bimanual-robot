@@ -9,7 +9,7 @@ const MENU = [
   { id: "robot", tab: "로봇 서빙", live: true, title: "로봇 서빙 · 음료",
     sub: "양팔 로봇이 컵에 따라 테이블까지 가져다드려요. 로봇은 한 번에 음료 한 잔을 서빙해요.",
     items: [
-      { id: "COLD_WATER", drink: "COLD_WATER", name: "얼음 냉수", desc: "시원한 물 한 잔", price: 0, photo: "cold_water" },
+      { id: "COLD_WATER", drink: "COLD_WATER", name: "냉수", desc: "시원한 물 한 잔", price: 0, photo: "cold_water" },
       { id: "HOT_WATER", drink: "HOT_WATER", name: "따뜻한 온수", desc: "따뜻한 물 한 잔", price: 0, photo: "hot_water" },
       { id: "LEMONADE", drink: "LEMONADE", name: "수제 레몬에이드", desc: "레몬청, 탄산수, 민트", price: 6000, photo: "lemonade" },
       { id: "COLA", drink: "COLA", name: "콜라", desc: "얼음 가득", price: 3000, photo: "cola" },
@@ -395,6 +395,14 @@ function renderStatus(state) {
     $("steps").hidden = true;
     if (staffPending) setStatus("주문이 접수됐어요", "주방에서 준비해 직원이 테이블로 가져다드려요.", 0, "receipt");
     else { setStatus("음식이 나왔어요", "맛있게 드세요!", STEPS.length, "done"); card.classList.add("ok"); }
+  } else if (order.state === "PENDING") {
+    robotDone = false;
+    setStatus("주문을 확인하고 있어요", "직원이 확인하면 곧 준비를 시작해요.", 0, STEPS[0].art);
+    $("cancel").hidden = false;
+  } else if (order.state === "ACCEPTED") {
+    robotDone = false;
+    setStatus(STEPS[0].title, STEPS[0].sub, 0, STEPS[0].art);
+    $("cancel").hidden = false;
   } else if (order.state === "QUEUED") {
     robotDone = false;
     const ahead = state.queue.indexOf(order.order_id) + (state.active_order_id ? 1 : 0);
@@ -409,6 +417,9 @@ function renderStatus(state) {
     card.classList.add("ok");
   } else if (order.state === "CANCELED") {
     setStatus("주문이 취소됐어요", "", -1, "fail");
+  } else if (order.state === "REJECTED") {
+    setStatus("주문을 받을 수 없어요", "죄송해요. 직원에게 문의해 주세요.", -1, "fail");
+    card.classList.add("fail");
   } else {
     setStatus("준비 중 문제가 생겼어요", "직원이 확인 후 직접 가져다드릴게요.", -1, "fail");
     card.classList.add("fail");

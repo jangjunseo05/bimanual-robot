@@ -121,10 +121,11 @@ def read_joints(robot) -> dict[str, float]:
 
 
 def move_joints(robot, target: dict[str, float], move_s: float, max_speed: float, tol: float,
-                label: str, fps: int = 50) -> tuple[bool, dict]:
+                label: str, fps: int = 50, stop_event: Event | None = None) -> tuple[bool, dict]:
     """target 관절만 부드럽게 옮긴다. 이미 1도 안이면 움직이지 않는다.
 
     도착 후 tol도 넘게 벗어난 관절이 있으면 더 밀지 않게 현재 위치를 목표로 고정하고 (False, 벗어난 관절)을 돌려준다.
+    stop_event가 켜지면 이동을 끊고 현재 위치를 목표로 고정한다.
     """
     cur = read_joints(robot)
     start = {k: float(cur[k]) for k in target}
@@ -136,6 +137,11 @@ def move_joints(robot, target: dict[str, float], move_s: float, max_speed: float
     log(f"{label}: {dur:.1f}s 동안 이동 (가장 큰 차이 {biggest:.1f}도)")
     steps = max(int(dur * fps), 1)
     for i in range(1, steps + 1):
+        if stop_event is not None and stop_event.is_set():
+            now = read_joints(robot)
+            send_arm_joints(robot, {k: float(now[k]) for k in target})
+            log(f"{label}: 중단 - 현재 위치에서 정지")
+            return False, {"stopped": True}
         t = i / steps
         t = t * t * (3 - 2 * t)
         send_arm_joints(robot, {k: start[k] * (1 - t) + target[k] * t for k in target})
@@ -453,8 +459,8 @@ class Service:
         try:
             if s["start_target"] is not None:
                 if not move_to_start_pose(robot, s["start_target"], self.ns.start_move_s,
-                                          self.ns.start_max_speed, self.ns.start_tol):
-                    result["reason"] = "start_pose_failed"
+                                          self.ns.start_max_speed, self.ns.start_tol, stop_event=event):
+                    result["reason"] = "stopped" if event.is_set() else "start_pose_failed"
                     return result
             result["start_pose_s"] = round(time.perf_counter() - t0, 2)
             if event.is_set():
@@ -498,14 +504,16 @@ class Service:
     def _run_stow(self, job: dict) -> dict:
         """양팔(그리퍼 제외)을 이동 자세로 옮긴다. 차가 서 있을 때만 부른다(호출하는 쪽 책임)."""
         robot = next(iter(self.contexts.values())).hardware.robot_wrapper
+        event = Event()
         with self.lock:
+            self.current_event, self.stop_requested = event, False
             self.arms = "busy"
         log("호출 stow -> 양팔 이동 자세")
         result = {"task": "stow", "ok": False, "reason": "", "started_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
         try:
             ok, off = move_joints(robot, self.stow_target, self.ns.start_move_s, self.ns.start_max_speed,
-                                  self.ns.start_tol, f"이동 자세 '{self.ns.stow_pose}'")
-            result["ok"], result["reason"] = ok, "stowed" if ok else "stow_failed"
+                                  self.ns.start_tol, f"이동 자세 '{self.ns.stow_pose}'", stop_event=event)
+            result["ok"], result["reason"] = ok, "stowed" if ok else "stopped" if event.is_set() else "stow_failed"
             if off:
                 result["off_joints"] = off
         except Exception as e:  # noqa: BLE001
@@ -524,6 +532,7 @@ class Service:
         """
         hw = self.contexts["pour"].hardware
         with self.lock:
+            self.current_event, self.stop_requested = Event(), False
             self.arms = "busy"
         log("호출 stow_right -> 오른팔만 이동 자세(복구)")
         result = {"task": "stow_right", "ok": False, "started_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
@@ -540,9 +549,16 @@ class Service:
         robot = hw.robot_wrapper.inner
         if not robot.is_connected:
             # 연결이 끊겨 끝 자세를 못 만들어도 "busy"로 남기지 않는다(관제·주행 쪽이 자세를 모른다는 뜻으로 hold)
+            # 그리퍼는 모터 버스로 풀므로 카메라가 끊겨도 쥔 힘을 뺄 수 있다
+            relax_grippers(robot, self.ns.margin, f"{task} 끝")
             with self.lock:
                 self.arms = "hold"
             return
+        # 작업 끝 감지도 정책을 끝내려고 current_event를 켠다. 끝 자세 이동은 새 이벤트로 /stop에만 반응한다
+        with self.lock:
+            self.current_event = Event()
+            if self.stop_requested:
+                self.current_event.set()
         # 중단·실패면 팔을 더 움직이지 않는다. 작업 끝 감지나 최대 시간 도달이면 rollout_handoff.py처럼 끝 자세로 간다.
         reason = result.get("reason", "")
         hold = s["end_pose"] == "final" or reason not in ("auto_done", "duration", "ended")
@@ -558,7 +574,8 @@ class Service:
         elif s["end_pose"] == "initial":
             make_pose_mover(hw.initial_position, self.ns.move_s, "연결 시 자세", self.ns.start_max_speed)(hw)
         else:
-            make_pose_mover(s["end_target"], self.ns.move_s, f"저장 자세 '{s['end_pose']}'", self.ns.start_max_speed)(hw)
+            make_pose_mover(s["end_target"], self.ns.move_s, f"저장 자세 '{s['end_pose']}'", self.ns.start_max_speed,
+                            stop_event=self.current_event)(hw)
             if s["end_pose"] == self.ns.stow_pose and reason == "auto_done":
                 arms = "stowed" if self._at(hw.robot_wrapper, s["end_target"]) else "hold"
         with self.lock:
@@ -573,7 +590,8 @@ class Service:
         right = {k: v for k, v in self.stow_target.items() if k.startswith("right_")}
         try:
             ok, off = move_joints(hw.robot_wrapper, right, self.ns.start_move_s, self.ns.start_max_speed,
-                                  self.ns.start_tol, f"오른팔 이동 자세 '{self.ns.stow_pose}'")
+                                  self.ns.start_tol, f"오른팔 이동 자세 '{self.ns.stow_pose}'",
+                                  stop_event=self.current_event)
         except Exception as e:  # noqa: BLE001
             ok, off = False, {"error": str(e)}
         result["right_stow"] = "ok" if ok else off

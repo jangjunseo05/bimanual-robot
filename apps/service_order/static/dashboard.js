@@ -22,6 +22,8 @@
   ]);
   const EVENT_LABELS = {
     CONTROLLER_STARTED: "관제 시작", CONTROLLER_RESTORED: "저장 상태 복구",
+    ORDER_RECEIVED: "주문 접수", ORDER_ACCEPTED: "주문 수락", ORDER_REJECTED: "주문 거절", ORDER_RELEASED: "START",
+    EMERGENCY_STOP: "긴급 정지", EMERGENCY_STOP_RESET: "긴급 정지 해제",
     ORDER_QUEUED: "주문 접수", ORDER_DUPLICATE_IGNORED: "중복 주문 무시", ORDER_CANCELED: "주문 취소",
     MISSION_STARTED: "미션 시작", PHASE_SUCCEEDED: "단계 완료", PHASE_RETRY: "단계 재시도",
     MISSION_SUCCEEDED: "서빙 완료", MISSION_FAILED: "미션 실패", CHARGE_REQUIRED: "충전 선행 결정",
@@ -30,7 +32,7 @@
     ROUNDTRIP_TERMINAL_HOLD: "왕복 실행 종료",
   };
   const LOCATION_LABELS = {dock: "충전소", kitchen: "주방", table_1: "1번 테이블", table_2: "2번 테이블", table_3: "3번 테이블", table_4: "4번 테이블"};
-  const STATE_LABELS = {QUEUED: "대기", RUNNING: "실행 중", SUCCEEDED: "완료", FAILED: "실패", CANCELED: "취소"};
+  const STATE_LABELS = {PENDING: "수락 대기", ACCEPTED: "수락됨", REJECTED: "거절", QUEUED: "대기", RUNNING: "실행 중", SUCCEEDED: "완료", FAILED: "실패", CANCELED: "취소"};
   const $ = id => document.getElementById(id);
   const state = {selectedDrink: "COLD_WATER", data: null};
   const text = (id, value) => { const node = $(id); if (node) node.textContent = value ?? "—"; };

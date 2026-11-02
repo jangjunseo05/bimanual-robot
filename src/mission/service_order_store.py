@@ -192,11 +192,14 @@ class ServiceOrderStore:
         event_count = self.connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]
         return {
             "total": sum(counts.values()),
+            "pending": counts.get("PENDING", 0),
+            "accepted": counts.get("ACCEPTED", 0),
             "queued": counts.get("QUEUED", 0),
             "running": counts.get("RUNNING", 0),
             "succeeded": counts.get("SUCCEEDED", 0),
             "failed": counts.get("FAILED", 0),
             "canceled": counts.get("CANCELED", 0),
+            "rejected": counts.get("REJECTED", 0),
             "events": event_count,
             "commands": command_count,
         }

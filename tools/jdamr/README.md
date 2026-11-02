@@ -228,6 +228,26 @@ Windows에 카메라 USB를 연결하면 RGB·깊이·CameraInfo를 Pi로 보내
 필요하다. 이 API는 영상 송신기를 포함하지 않는다. 현재의 Pi USB 카메라 주행 준비와
 Windows 카메라를 사용하는 추론 포함 준비는 구분한다.
 
+### 관제 화면 START·STOP 따라가기
+
+`serve`에 `--follow-web`을 붙이면 이 PC가 주문 서버를 0.5초마다 읽어 관제 화면을 따른다.
+`start`를 따로 실행하지 않는다.
+
+```bash
+python3 tools/jdamr/water_service_api.py serve --order-url http://192.168.0.157:8765 --follow-web
+```
+
+- 출발 신호는 START 자체가 아니라 팔 접기가 끝난 상태다. 같은 주문의 `waiting_alignment.station=kitchen`,
+  `drive.next=kitchen`, `arms_ready=true`가 모두 참일 때 `web-<주문 번호>` 요청으로 한 번만 시작한다.
+- STOP(`emergency_stop.active`)은 진행 중 미션을 멈추고 새 출발을 막는다. 주행 중 감시도 같은 값을 읽어 도크 복귀 구간까지 멈춘다.
+- 차를 멈추는 경로는 `jdamr_depart.py stop`이다. 정지까지의 실제 지연은 측정 전이다.
+- `--follow-dry-run`을 더하면 판단만 `follow: would_start <주문>`, `follow: would_stop`으로 출력하고 아무것도 시작·정지하지 않는다.
+- 이 PC의 상태는 `/api/drive/heartbeat`로 보고되어 관제 화면 제목 아래에 표시된다. 3초 넘게 보고가 없으면 미연결로 표시한다.
+- 조작 실행기 없이 연결만 시험할 때는 Windows에서 `tools/rollout/start_scenario.bat` 대신
+  `tools/rollout/rehearsal_service.py`와 주문 서버만 켠다. 가짜 실행기는 하드웨어를 열지 않는다.
+- 주문 서버는 수락과 START 전에는 주문을 시작하지 않는다. `--follow-web` 없이 `start`만 실행하면
+  진행 중 주문에 연결되고, 진행 중 주문이 없으면 새 주문이 `PENDING`에 머물러 300초 뒤 실패한다.
+
 ### Windows 공유 Astra 입력
 
 현재 주행의 센서 입력 기본값은 `JDAMR_CAMERA_TRANSPORT=windows_tcp`다.
