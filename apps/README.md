@@ -4,7 +4,7 @@
 |---|---|---|
 | service_order/ | 주문 API·주문/미션 화면 | `python3 -m apps.service_order.service_order_server --backend immediate --port 8765` |
 | service_order/ `/order` | 손님용 주문 화면(테이블·음료 선택, 진행 상황 확인, 대기 중 취소) | 위 서버 실행 뒤 `http://<주소>:8765/order?table=3` |
-| service_order/ `/control` | 운영자용 관제 화면(주문 수락·거절, START·STOP, 로봇 상태, 진행 단계, 일시정지, 대리 주문) | 위 서버 실행 뒤 `http://<주소>:8765/control` |
+| service_order/ `/control` | 운영자용 관제 화면(주문 수락·거절, START·STOP, 로봇 상태, 진행 단계, 토픽·명령·이벤트 기록) | 위 서버 실행 뒤 `http://<주소>:8765/control` |
 | camera_dashboard/ | RGB 카메라 관제·요청에 따른 정지 | `python3 -m apps.camera_dashboard.camera_dashboard --help` |
 | project_site/ | 프로젝트 소개 소스 | 해당 폴더에서 `npm ci`, `npm run dev` |
 | ../src/navigation/dashboard/ | Pi 주행 telemetry 대시보드 | [배포 안내](../src/navigation/deployment/README.md) |
@@ -28,8 +28,8 @@ CPU immediate 주문 모드는 하드웨어를 움직이지 않는다. 주문 �
 - 손님용 `/order?table=N`: 테이블 QR에 이 주소를 넣으면 테이블 선택을 건너뛴다. 주문 뒤 주소에
   `order=<주문 번호>`가 붙어 새로고침해도 같은 주문을 계속 보여 준다. 취소는 대기 중일 때만 가능하다.
 - 운영자용 `/control`: 들어온 주문을 수락·거절하고, 수락한 주문을 START로 시작하며, STOP으로 긴급 정지한다.
-  직원 대리 주문은 수락된 상태로 들어간다. 자동 진행 일시정지·재개(`POST /api/control {"paused": bool}`),
-  최근 주문·실패 원인, 이벤트 기록도 본다. dry-run 모드에서는 한 단계 진행·실패 주입 시험 도구가 보인다.
+  주문은 손님 화면으로 들어온다. 주문 실패 원인은 이벤트·백엔드 명령 기록에서 본다. 화면에 대리 주문과 일시정지 버튼은 없고,
+  `POST /api/orders`(`accepted: true`)와 `POST /api/control {"paused": bool}` API는 남아 있다. dry-run 모드에서는 한 단계 진행·실패 주입 시험 도구가 보인다.
 - 주문 상태: `PENDING`(수락 대기) → `ACCEPTED`(수락됨) → START → `QUEUED`·`RUNNING`, 거절은 `REJECTED`.
   주문이 들어와도 START 전에는 팔이 움직이지 않는다. 예전처럼 주문 즉시 시작하려면 서버를 `--auto-dispatch`로 띄운다.
 - START는 수락한 주문 중 가장 오래된 것을 시작한다(`POST /api/mission/start`). 진행 중 미션, 긴급 정지,

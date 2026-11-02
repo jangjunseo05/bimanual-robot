@@ -250,7 +250,7 @@
     } else if (cancel) {
       const order = s.orders.find((o) => o.order_id === decodeURIComponent(cancel[1]));
       if (!order) throw new ApiError("unknown order", 404);
-      if (["QUEUED", "RUNNING"].includes(order.state)) {
+      if (["PENDING", "ACCEPTED", "QUEUED", "RUNNING"].includes(order.state)) {
         record(s, "ORDER_CANCELED", { order_id: order.order_id });
         if (order.state === "RUNNING") finish(s, order, "CANCELED");
         else { order.state = "CANCELED"; order.completed_at = now(); }

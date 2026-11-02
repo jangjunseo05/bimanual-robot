@@ -1,4 +1,4 @@
-// 배포된 데모 화면 E2E 확인: 손님 메뉴(스크롤 탭) -> 주문 확인 창 -> 관제 표시 -> 일시정지/한 단계 진행 -> 대리 주문·취소 -> 완료 -> 손님 취소 -> 음식 주문·직원 서빙.
+// 배포된 데모 화면 E2E 확인: 손님 메뉴(스크롤 탭) -> 주문 확인 창 -> 관제 표시 -> 일시정지(API)/한 단계 진행 -> 수락 주문(API)·취소 -> 완료 -> 손님 취소 -> 음식 주문·직원 서빙.
 // 준비: 빈 폴더에서 `npm i puppeteer-core@23.11.1` 후 이 파일을 복사해 실행한다(Edge 사용, Windows 경로).
 // 실행: node e2e_demo.js [사이트 주소] [스크린샷 폴더]
 const os = require("os");
@@ -44,8 +44,17 @@ const ok = (cond, msg) => { console.log(`${cond ? "PASS" : "FAIL"} ${msg}`); if 
   control.on("dialog", (d) => d.accept());
   await control.goto(`${BASE}/control`, { waitUntil: "networkidle0" });
   await sleep(1200);
+  // 주문은 수락 → START 뒤에 시작한다(#97)
+  await (await control.$$("#queue tr button"))[0].click();
+  await sleep(1200);
+  await control.click("#start");
+  await sleep(1200);
   ok((await text(control, "#current-head")).includes("3번 테이블"), "관제 화면에 현재 주문 표시");
-  await control.click("#pause");
+  // 화면 버튼은 없앴고 API는 남아 있다. 시험 도구를 안정적으로 보려고 API로 멈춘다.
+  const setPaused = (paused) => control.evaluate((value) => window.orderApi("/api/control", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ paused: value }),
+  }), paused);
+  await setPaused(true);
   await sleep(1200);
   ok(!(await control.$eval("#paused-banner", (e) => e.hidden)), "일시정지 배너 표시");
   const phaseA = await text(control, "#current-head");
@@ -56,19 +65,21 @@ const ok = (cond, msg) => { console.log(`${cond ? "PASS" : "FAIL"} ${msg}`); if 
   ok(phaseA !== (await text(control, "#current-head")), "시험 도구: 한 단계 진행");
   await control.screenshot({ path: `${OUT}/2_control_paused.png` });
 
-  // 직원 대리 주문 2건 -> 대기열, 하나는 관제에서 취소
-  await control.select("#f-table", "table_1");
-  await control.click("#f-submit");
+  // 관제에 대리 주문 칸은 없다. 수락된 주문을 API로 넣어 대기열과 취소를 확인한다.
+  const addOrder = (table) => control.evaluate((id) => window.orderApi("/api/orders", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ table_id: id, drink: "COLD_WATER", accepted: true }),
+  }), table);
+  await addOrder("table_1");
   await sleep(300);
-  await control.select("#f-table", "table_2");
-  await control.click("#f-submit");
+  await addOrder("table_2");
   await sleep(1200);
-  ok((await control.$$("#queue tr button")).length === 2, "대리 주문 2건 대기열");
+  ok((await control.$$("#queue tr button")).length === 2, "수락된 주문 2건 대기열");
   await (await control.$$("#queue tr button"))[1].click();
   await sleep(1200);
   ok((await control.$$("#queue tr button")).length === 1, "관제에서 대기 주문 취소");
 
-  await control.click("#pause"); // 재개
+  await setPaused(false);
   await guest.bringToFront();
   const deadline = Date.now() + 60000;
   while (Date.now() < deadline && (await text(guest, "#status-title")) !== "물이 도착했어요") await sleep(1000);
@@ -81,7 +92,7 @@ const ok = (cond, msg) => { console.log(`${cond ? "PASS" : "FAIL"} ${msg}`); if 
   }
   await guest.screenshot({ path: `${OUT}/3_guest_done.png` });
 
-  // 새 주문 -> 대기 중 손님 취소 (앞 주문이 진행 중이어야 대기 상태가 된다)
+  // 새 주문 -> 수락 대기 중 손님 취소
   await guest.click("#again");
   await guest.click('[data-drink="HOT_WATER"]');
   await guest.click("#submit");
@@ -90,15 +101,15 @@ const ok = (cond, msg) => { console.log(`${cond ? "PASS" : "FAIL"} ${msg}`); if 
   await guest.waitForSelector("#track-view:not([hidden])");
   await sleep(1200);
   const queuedSub = await text(guest, "#status-sub");
-  ok(queuedSub.includes("앞에"), `대기 순서 안내 (${queuedSub})`);
+  ok(queuedSub.includes("직원이 확인"), `수락 대기 안내 (${queuedSub})`);
   await guest.click("#cancel");
   await sleep(1500);
   ok((await text(guest, "#status-title")) === "주문이 취소됐어요", "손님 대기 주문 취소");
 
   await control.bringToFront();
   await sleep(1500);
-  const history = await text(control, "#history");
-  ok(history.includes("완료") && history.includes("취소"), "관제 최근 주문에 완료·취소 기록");
+  const eventLog = await text(control, "#events");
+  ok(eventLog.includes("MISSION_SUCCEEDED") && eventLog.includes("ORDER_CANCELED"), "관제 이벤트 기록에 완료·취소 표시");
   await control.screenshot({ path: `${OUT}/4_control_history.png`, fullPage: true });
 
   // 음식만 주문 -> 직원 서빙 목록 -> 서빙 완료 -> 손님 화면 완료

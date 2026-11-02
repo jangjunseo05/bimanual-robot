@@ -1,7 +1,7 @@
 "use strict";
 
-// 로봇 운영 콘솔. /api/state를 1초마다 읽어 주문 수락·미션 호출, 긴급 정지, 실패 원인 기록, 대기열, 대리 주문과
-// 배터리, 미션 단계, 조작 실행기, 지도 위 로봇 위치를 스크롤 없이 한 화면에 보여 준다.
+// 로봇 운영 콘솔. /api/state를 1초마다 읽어 주문 수락·미션 호출, 긴급 정지, 대기열, 직원 서빙과
+// 배터리, 미션 단계, 조작 실행기, 지도 위 로봇 위치, ROS 2 토픽, 백엔드 명령, 이벤트를 스크롤 없이 한 화면에 보여 준다.
 // 위치와 파이 전압은 서버를 --robot-pose-url 로 띄워 파이의 주행 대시보드(ammr_dashboard)를 읽을 때만 실제 값이다.
 const SERVICE_PHASES = [
   ["NAVIGATE_KITCHEN", "주방 이동", "nav"], ["ALIGN_KITCHEN", "주방 정렬", "nav"], ["GRASP_CUP", "컵 파지", "manip"],
@@ -32,6 +32,24 @@ const TASK_LABEL = { pour: "물따르기", place: "컵배치", stow: "팔 접기
 const BATTERY_RANGE_V = { arm: null, pi: null };
 // 경고 전압: 팔은 tools/rollout/arm_health.py, 파이는 restaurant_service_contract.yaml(출발 10.8 V, 주행 10.5 V)
 const BATTERY_ALERT_V = { arm: { warn: 9.0, bad: 9.0 }, pi: { warn: 10.8, bad: 10.5 } };
+
+// 파이 주행 대시보드(ammr_dashboard)가 구독하는 토픽과 스냅샷 안의 위치
+const vel = (v) => v.linear_mps != null ? `v ${v.linear_mps.toFixed(2)} · ω ${v.angular_rps.toFixed(2)}` : "";
+const TOPICS = [
+  ["/scan", (n) => n.lidar, (v) => v.fps != null ? `${v.fps} Hz` : ""],
+  ["/odom", (n) => n.motion?.odom, vel],
+  ["/cmd_vel", (n) => n.motion?.cmd, vel],
+  ["/cmd_vel_smoothed", (n) => n.motion?.requested_cmd, vel],
+  ["/tf map→base_link", (n) => n.navigation?.localization, (v) => v.x_m != null ? `(${v.x_m.toFixed(2)}, ${v.y_m.toFixed(2)}) ${Math.round(v.yaw_deg)}°` : ""],
+  ["/map", (n) => n.navigation?.map, (v) => v.width ? `${v.width}×${v.height} @${v.resolution_m} m` : ""],
+  ["/plan", (n) => n.navigation?.path, (v) => v.points_xy_m ? `${v.points_xy_m.count ?? v.points_xy_m.length} pts` : ""],
+  ["/navigate_to_pose", (n) => n.navigation?.goal, (v) => v.status || ""],
+  ["/collision_monitor_state", (n) => n.navigation?.collision, (v) => v.action || v.state || ""],
+  ["/box_parking/execution_status", (n) => n.navigation?.execution, (v) => v.state || ""],
+  ["/battery_state", (n) => n.battery, (v) => v.voltage_v != null ? `${v.voltage_v.toFixed(2)} V` : ""],
+  ["/imu/data_raw", (n) => n.imu, (v) => v.angular_z_rps != null ? `ωz ${v.angular_z_rps.toFixed(2)}` : ""],
+  ["/depth_navigation/status", (n) => n.depth_navigation, (v) => v.state || v.mode || ""],
+];
 
 const $ = (id) => document.getElementById(id);
 let state = null;
@@ -66,6 +84,13 @@ function failureText(failure) {
 }
 function badge(orderState) { return el("span", STATE_LABEL[orderState] || orderState, `badge ${orderState}`); }
 function setDot(id, level) { $(id).className = `dot ${level}`; }
+function statusCell(level, text) { const s = el("span", text, `st ${level}`); s.prepend(el("i", undefined, `dot ${level === "off" ? "" : level}`)); return s; }
+function logLine(at, key, text, className) {
+  const li = el("li", undefined, className);
+  li.append(el("span", time(at), "t"), el("span", key, "k"), document.createTextNode(text));
+  li.title = `${time(at)} ${key} ${text}`;
+  return li;
+}
 
 // 주문 번호 표시: 9자리(YYMMDDNNN)가 아닌 예전 번호(WEB-…, STAFF-…, 시험용)도 같은 형식으로 보여 준다.
 // 접수 날짜별로 시간순으로, 그날 이미 쓰인 9자리 번호를 건너뛰며 남는 번호를 붙인다(화면 표시만, 서버 기록은 그대로).
@@ -176,8 +201,6 @@ function render() {
     $("align-confirm").textContent = `정렬 완료 → ${next} 실행`;
     $("align-confirm").dataset.station = waiting.station;
   }
-  $("pause").textContent = state.auto_paused ? "자동 진행 재개" : "자동 진행 일시정지";
-  $("pause").className = state.auto_paused ? "btn primary" : "btn";
   $("paused-banner").hidden = !state.auto_paused;
   renderRunControls();
   $("test-tools").hidden = !sim;
@@ -186,6 +209,9 @@ function render() {
   renderFsm(active, tickets);
   renderJobs(tickets);
   renderStaff();
+  renderTopics();
+  renderCommands(eb);
+  renderEvents();
   drawMap(active);
   renderMapInfo();
 }
@@ -302,6 +328,64 @@ function renderManip(m, simulated) {
   setDot("k-manip-dot", level);
 }
 
+function renderTopics() {
+  const feed = state.robot_nav;
+  const nav = feed?.connected ? feed.snapshot : null;
+  let liveCount = 0;
+  $("topics").replaceChildren(...TOPICS.map(([name, pick, detail]) => {
+    const v = nav ? pick(nav) : null;
+    let cell = statusCell("off", "없음");
+    if (v && v.age_s != null) {
+      cell = v.live ? statusCell("ok", "수신") : statusCell("warn", "지연");
+      if (v.live) liveCount += 1;
+    }
+    const text = v ? detail(v) : "";
+    const age = v && v.age_s != null ? secs(v.age_s) : "-";
+    const tr = row([cell, el("span", name, "mono"), text || age]);
+    tr.title = `${name} · ${text || "-"} · 경과 ${age}`;
+    return tr;
+  }));
+  $("topic-tag").textContent = nav ? `${liveCount}/${TOPICS.length} 수신` : "미연결";
+  $("topic-tag").className = `tag ${nav ? "ok" : ""}`;
+  const parts = [];
+  if (nav) {
+    const g = nav.graph || {};
+    parts.push(`대시보드 ${feed.latency_ms} ms`, `노드 ${g.nodes ?? "-"}`, `토픽 ${g.topics ?? "-"}`);
+    for (const [k, val] of Object.entries(nav.system || {})) if (typeof val === "number" && k !== "age_s") parts.push(`${k} ${val.toFixed(1)}`);
+  }
+  $("topic-note").textContent = nav ? parts.join(" · ") : feed?.error ? `수신 실패: ${feed.error}` : "주행 대시보드 미연결(--robot-pose-url)";
+  $("topic-note").title = $("topic-note").textContent;
+}
+
+function renderCommands(eb) {
+  let cmds = state.recent_commands || [];
+  if (!cmds.length && isSim()) {
+    // 데모 백엔드는 명령 기록이 없어서 이벤트의 단계 완료로 대신 보여 준다.
+    cmds = state.events.filter((e) => e.kind === "PHASE_SUCCEEDED" || e.kind === "MISSION_FAILED").map((e) => ({
+      at: e.timestamp, phase: e.completed_phase || e.failed_phase, success: e.kind === "PHASE_SUCCEEDED", failure_code: e.failure || null,
+      adapter: eb.mode,
+    }));
+  }
+  $("cmd-count").textContent = `${cmds.length}`;
+  $("commands").replaceChildren(...(cmds.length ? cmds.slice(-20).reverse().map((c) => logLine(c.at, PHASE_LABEL[c.phase] || c.phase || "-",
+    [c.success == null ? "-" : c.success ? "성공" : `실패 ${c.failure_code || ""}`, c.kind ? `${c.kind}:${c.name || "-"}` : "", c.duration_s != null ? secs(c.duration_s) : "", c.adapter || ""].filter(Boolean).join(" · "),
+    c.success === false ? "fail" : c.success ? "ok" : "")) : [el("li", "아직 실행된 명령이 없습니다.")]));
+  const t = eb.manipulation_service_timings || {};
+  const ms = (s) => s != null ? `${Math.round(s * 1000)} ms` : "-";
+  const r = eb.manipulation_last_result;
+  const last = r ? ` · 마지막 ${TASK_LABEL[r.task] || r.task} ${r.ok ? "성공" : "실패"}${r.reason ? ` ${r.reason}` : ""}` : "";
+  $("manip-note").textContent = eb.manipulation_service_state ? `추론 물따르기 ${ms(t.pour_infer_s)} · 컵배치 ${ms(t.place_infer_s)}${last}` : "";
+  $("manip-note").title = $("manip-note").textContent;
+}
+
+function renderEvents() {
+  $("events").replaceChildren(...state.events.slice(-40).reverse().map((e) => {
+    const phase = e.completed_phase || e.failed_phase;
+    return logLine(e.timestamp, e.kind, [no(e.order_id), PHASE_LABEL[phase] || phase, failureText(e.failure)].filter((x) => x && x !== "-").join(" · "),
+      /FAIL/.test(e.kind) ? "fail" : /SUCCEEDED|ARRIVED|COMPLETED/.test(e.kind) ? "ok" : "");
+  }));
+}
+
 function orderButton(label, className, handler) {
   const button = el("button", label, `btn small ${className}`);
   button.type = "button";
@@ -335,31 +419,19 @@ function renderJobs(tickets) {
       badge(o.state), orderActions(o)]);
   });
   $("queue").replaceChildren(...(queueRows.length ? queueRows : [emptyRow("들어온 주문이 없습니다.", 5)]));
-  const done = state.orders.filter((o) => ["SUCCEEDED", "FAILED", "CANCELED", "REJECTED"].includes(o.state)).reverse().slice(0, 12);
-  $("history").replaceChildren(...(done.length
-    ? done.map((o) => {
-      const tr = row([el("span", no(o.order_id), "mono"), badge(o.state), time(o.completed_at), failureText(o.failure)]);
-      tr.lastChild.className = "reason";
-      return tr;
-    })
-    : [emptyRow("아직 끝난 미션이 없습니다.", 4)]));
 }
 
 function renderStaff() {
   // 직원이 가져다줄 음식(로봇은 음료만 맡는다)
   const staff = (state.tickets || []).filter((t) => t.staff_state === "PREPARING");
   $("staff-count").textContent = staff.length ? `${staff.length}건` : "";
-  $("staff-wrap").hidden = !staff.length;
+  $("staff-card").hidden = !staff.length;
   $("staff").replaceChildren(...staff.map((t) => {
     const served = el("button", "서빙 완료", "btn small primary");
     served.type = "button";
     served.addEventListener("click", () => act(() => api(`/api/tickets/${encodeURIComponent(t.order_id)}/served`, {})));
     return row([el("span", no(t.order_id), "mono"), place(t.table_id), itemsText(t), served]);
   }));
-  if (!$("f-table").options.length) {
-    const tables = state.restaurant.tables.map((t) => t.id);
-    $("f-table").replaceChildren(...tables.map((id) => { const o = el("option", place(id)); o.value = id; return o; }));
-  }
 }
 
 async function act(fn) {
@@ -376,7 +448,6 @@ $("align-confirm").addEventListener("click", () => {
     act(() => api("/api/align/confirm", { station }));
   }
 });
-$("pause").addEventListener("click", () => act(() => api("/api/control", { paused: !state?.auto_paused })));
 $("drive-init").addEventListener("click", () => {
   if (confirm("차가 도크에 있나요?\n차는 움직이지 않고 Nav2를 켜서 위치만 다시 잡습니다.")) {
     act(() => api("/api/drive/init", {}));
@@ -395,13 +466,6 @@ $("estop-reset").addEventListener("click", () => {
     act(() => api("/api/emergency-stop/reset", {}));
   }
 });
-$("f-submit").addEventListener("click", () => act(async () => {
-  // 주문 번호(YYMMDDNNN)는 서버가 붙인다.
-  const order = { table_id: $("f-table").value, drink: $("f-drink").value, accepted: true };
-  const result = await api("/api/orders", order);
-  $("f-msg").textContent = `주문 ${result.order.order_id} 등록 · ${place(order.table_id)} · ${DRINKS[order.drink]}`;
-}));
-
 // ---------- 지도: 교실 지도(classroom) 위에 충전소·급수대·테이블과 로봇 위치 ----------
 // 실시간 위치는 서버의 --robot-pose-url(파이 주행 대시보드)에서 온다. 없으면 진행 단계와 경과 시간으로 추정한다.
 const MAP = { meta: null, img: null };
@@ -412,8 +476,6 @@ fetch("/map/classroom.json").then((r) => r.json()).then((meta) => {
 }).catch(() => { $("map-note").textContent = "지도를 불러오지 못했습니다."; });
 
 const STATION_COLOR = { dock: "#2b8a5a", kitchen: "#e8590c" };
-// 표시 범위(map 좌표, m): home_dock·water_station·table_01과 그 둘레의 벽까지
-const MAP_VIEW = { x_min: -4.65, x_max: 1.113, y_min: -4.964, y_max: 2.14 };
 const STATION_FRAME = { dock: "home_dock", kitchen: "water_station", table_1: "table_01" };
 function stationOf(id) {
   if (!MAP.meta || !id) return null;
@@ -447,10 +509,9 @@ function estimatedPose(active) {
     goal: there, remaining_m: dist * (1 - t),
   };
 }
-function fitMapCanvas(canvas) {
-  // 칸 크기에 맞춰 지도 비율을 유지한 채 가장 크게 그린다. 크기가 바뀔 때만 다시 잡는다.
+function fitMapCanvas(canvas, aspect) {
+  // 전체 지도를 칸 크기에 맞춰 비율을 유지한 채 가장 크게 그린다. 크기가 바뀔 때만 다시 잡는다.
   const box = $("map-wrap");
-  const aspect = (MAP_VIEW.x_max - MAP_VIEW.x_min) / (MAP_VIEW.y_max - MAP_VIEW.y_min);
   const cssWidth = Math.max(1, Math.floor(Math.min(box.clientWidth, box.clientHeight * aspect)));
   const cssHeight = Math.max(1, Math.floor(cssWidth / aspect));
   const ratio = window.devicePixelRatio || 1;
@@ -467,22 +528,17 @@ function drawMap(active) {
   const canvas = $("map");
   if (!MAP.meta || !state) return;
   const { meta, img } = MAP;
-  const { cssWidth, cssHeight, ratio } = fitMapCanvas(canvas);
+  const { cssWidth, cssHeight, ratio } = fitMapCanvas(canvas, meta.width / meta.height);
   const ctx = canvas.getContext("2d");
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.imageSmoothingEnabled = false;
-  const view = MAP_VIEW;
-  const sx = (view.x_min - meta.origin.x_m) / meta.resolution_m;
-  const sy = meta.height - (view.y_max - meta.origin.y_m) / meta.resolution_m;
-  const sw = (view.x_max - view.x_min) / meta.resolution_m;
-  const sh = (view.y_max - view.y_min) / meta.resolution_m;
-  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, cssWidth, cssHeight);
-  const metre = cssWidth / (view.x_max - view.x_min);
-  const px = (x, y) => [(x - view.x_min) * metre, (view.y_max - y) * metre];
+  ctx.drawImage(img, 0, 0, cssWidth, cssHeight);
+  const scale = cssWidth / meta.width;
+  const px = (x, y) => [((x - meta.origin.x_m) / meta.resolution_m) * scale, (meta.height - (y - meta.origin.y_m) / meta.resolution_m) * scale];
   // 1 m 격자
   ctx.save(); ctx.strokeStyle = "rgba(22,119,200,.10)"; ctx.lineWidth = 1;
-  for (let x = Math.ceil(view.x_min); x < view.x_max; x += 1) { const [gx] = px(x, 0); ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, cssHeight); ctx.stroke(); }
-  for (let y = Math.ceil(view.y_min); y < view.y_max; y += 1) { const [, gy] = px(0, y); ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(cssWidth, gy); ctx.stroke(); }
+  for (let x = Math.ceil(meta.origin.x_m); x < meta.origin.x_m + meta.width * meta.resolution_m; x += 1) { const [gx] = px(x, 0); ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, cssHeight); ctx.stroke(); }
+  for (let y = Math.ceil(meta.origin.y_m); y < meta.origin.y_m + meta.height * meta.resolution_m; y += 1) { const [, gy] = px(0, y); ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(cssWidth, gy); ctx.stroke(); }
   ctx.restore();
   ctx.font = "bold 12px Consolas, monospace";
   for (const s of meta.stations) {
@@ -492,7 +548,8 @@ function drawMap(active) {
     ctx.fillStyle = "#1f3553";
     const right = x > cssWidth * 0.6; // 오른쪽 끝 역은 이름을 왼쪽에 써서 잘리지 않게 한다
     ctx.textAlign = right ? "right" : "left";
-    ctx.fillText(STATION_FRAME[s.id] || s.id, right ? x - 9 : x + 9, y - 8);
+    // 전체 지도에서는 충전소와 급수대 이름이 겹치므로 급수대 이름은 점 아래에 쓴다
+    ctx.fillText(STATION_FRAME[s.id] || s.id, right ? x - 9 : x + 9, s.id === "kitchen" ? y + 16 : y - 8);
   }
   const rp = state.robot_pose;
   let pose = null;
@@ -533,10 +590,9 @@ function renderMapInfo() {
   src.textContent = { LIVE: "실시간 위치", LAST: "마지막 위치", EST: "추정 위치" }[label] || "";
   src.className = label === "LIVE" ? "pose-live" : "pose-est";
   if (!pose) return;
-  const outside = pose.x_m < MAP_VIEW.x_min || pose.x_m > MAP_VIEW.x_max || pose.y_m < MAP_VIEW.y_min || pose.y_m > MAP_VIEW.y_max;
   const where = `(${pose.x_m.toFixed(2)}, ${pose.y_m.toFixed(2)}) m · ${pose.yaw_deg.toFixed(0)}°`;
   const reason = label === "LIVE" ? "" : state.robot_pose?.error ? ` · 수신 실패: ${state.robot_pose.error}` : " · 실시간 위치 미연결, 진행 단계로 추정";
-  $("map-note").textContent = `${where}${outside ? " · 표시 범위 밖" : ""}${reason}`;
+  $("map-note").textContent = `${where}${reason}`;
   $("map-note").title = $("map-note").textContent;
 }
 // 1초마다 오는 상태 사이에도 점이 부드럽게 움직이도록 지도만 다시 그린다.

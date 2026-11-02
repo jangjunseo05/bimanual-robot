@@ -24,7 +24,7 @@
     button:focus-visible, select:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
     /* 화면 전체: 위 고정 줄 + 남는 높이를 모두 쓰는 보드. 페이지는 스크롤하지 않는다. */
-    main { display: flex; flex-direction: column; gap: 8px; height: 100vh; height: 100dvh; padding: 0 12px 10px; }
+    main { display: flex; flex-direction: column; gap: 8px; height: 100vh; height: 100dvh; padding: 0 12px 10px; overflow: hidden; }
     header { flex: none; display: flex; align-items: center; gap: 12px; margin: 0 -12px; padding: 7px 12px; background: var(--panel); border-bottom: 1px solid var(--line); }
     .title { flex: none; min-width: 0; max-width: 340px; }
     h1 { margin: 0; font-size: 16px; letter-spacing: -.01em; }
@@ -63,8 +63,8 @@
     .dot.bad { background: var(--danger); box-shadow: 0 0 0 3px var(--danger-soft); }
     .dot.run { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 
-    /* 지도 칸 폭은 남는 높이에서 나온다(잘라낸 지도 비율 약 0.81). */
-    .board { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) min(calc((100vh - 190px) * .81), 42vw); gap: 8px; }
+    /* 지도 칸 폭은 남는 높이에서 나온다. 전체 지도는 이 칸 안에 비율을 유지해 맞춘다. */
+    .board { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) min(calc((100vh - 190px) * .81), 42vw); grid-template-rows: minmax(0, 1fr); gap: 8px; }
     .col { display: flex; flex-direction: column; gap: 8px; min-width: 0; min-height: 0; }
     .card { display: flex; flex-direction: column; padding: 8px 10px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); min-width: 0; min-height: 0; }
     .card.flat { flex: none; }
@@ -88,8 +88,8 @@
     .ph .layer { position: absolute; top: -7px; left: 50%; transform: translateX(-50%); padding: 0 5px; border-radius: 4px; font-size: 9px; font-weight: 800; background: var(--bg); }
     .layer.nav { color: #0a6e96; } .layer.manip { color: #6a46c2; }
 
-    /* 대기열 · 실패 원인: 남는 높이를 나눠 쓰고, 행이 넘치면 칸 안에서만 스크롤한다 */
-    .lists { flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 8px; }
+    /* 대기열은 약 4줄 높이로 고정하고, 넘치면 칸 안에서만 스크롤한다 */
+    .queue-wrap { flex: none; height: 156px; }
     .table-wrap { flex: 1; min-height: 0; overflow: auto; }
     table { width: 100%; border-collapse: collapse; }
     th, td { padding: 4px 5px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; }
@@ -97,8 +97,6 @@
     td { font-size: 12px; }
     tr:last-child td { border-bottom: 0; }
     td.mono, td .mono { font-family: var(--mono); font-size: 11.5px; }
-    td.reason { word-break: break-all; }
-    #history td:nth-child(3) { white-space: nowrap; }
     .empty { color: var(--faint); padding: 6px 0; }
     .badge { display: inline-block; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 700; white-space: nowrap; }
     .badge.PENDING { background: var(--warn-soft); color: var(--warn); }
@@ -110,12 +108,24 @@
     .badge.FAILED { background: var(--danger-soft); color: var(--danger); }
     .badge.CANCELED { background: var(--panel-2); color: var(--muted); }
 
-    /* 대리 주문 */
-    .form { display: flex; align-items: center; gap: 8px; }
-    .form h2 { flex: none; }
-    .form select { flex: none; padding: 4px 6px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-2); }
-    .form .msg { flex: 1; min-width: 0; color: var(--muted); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .staff-wrap { max-height: 76px; margin-top: 6px; }
+    .staff-wrap { max-height: 76px; }
+
+    /* 기술 정보: 남는 높이를 나눠 쓰고, 넘치면 칸 안에서만 스크롤한다 */
+    .tech { flex: 1; min-height: 0; overflow: hidden; display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); gap: 8px; }
+    .tech table { table-layout: fixed; }
+    .tech td { padding: 2px 4px; font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .tech td:nth-child(1) { width: 46px; }
+    .tech td:nth-child(2) { width: 58%; }
+    .log { flex: 1; min-height: 0; overflow: auto; margin: 0; padding: 0; list-style: none; font-family: var(--mono); font-size: 11.5px; }
+    .log li { padding: 2px 0; border-bottom: 1px dashed var(--line); color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .log .t { color: var(--faint); margin-right: 6px; }
+    .log .k { color: var(--accent); margin-right: 6px; }
+    .log li.fail .k { color: var(--danger); }
+    .log li.ok .k { color: var(--ok); }
+    .note { flex: none; margin: 4px 0 0; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .st { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; font-weight: 700; }
+    .st.ok { color: var(--ok); } .st.warn { color: var(--warn); } .st.off { color: var(--faint); }
+    .st .dot { width: 6px; height: 6px; box-shadow: none; }
 
     /* 지도 */
     .map-card { flex: 1; }
@@ -125,14 +135,19 @@
     .pose-live { color: var(--ok); font-weight: 700; }
     .pose-est { color: var(--warn); font-weight: 700; }
 
+    /* 낮은 화면에서는 기술 정보 칸이 남도록 대기열을 약 3줄로 줄인다 */
+    @media (max-height: 700px) { .queue-wrap { height: 118px; } .staff-wrap { max-height: 52px; } }
+
     /* 좁은 화면(휴대폰)은 한 화면에 담을 수 없으므로 세로로 쌓고 스크롤을 허용한다 */
     @media (max-width: 900px) {
       body { overflow: auto; }
-      main { height: auto; }
+      main { height: auto; overflow: visible; }
       header { flex-wrap: wrap; }
       .hints { flex-basis: 100%; order: 3; text-align: left; }
       .kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .board, .lists { grid-template-columns: minmax(0, 1fr); }
+      .board, .tech { grid-template-columns: minmax(0, 1fr); }
+      .tech { overflow: visible; }
+      .tech .card { height: 240px; }
       .fsm { grid-template-columns: repeat(4, 1fr); row-gap: 10px; }
       .map-wrap { height: 70vw; flex: none; }
     }
@@ -150,7 +165,6 @@
       <span class="run-hint" id="start-hint"></span>
     </div>
     <div class="actions">
-      <button type="button" class="btn" id="pause">자동 진행 일시정지</button>
       <button type="button" class="btn" id="drive-init" disabled>주행 초기화</button>
       <button type="button" class="btn start" id="start" disabled>START</button>
       <button type="button" class="btn stop" id="stop">STOP</button>
@@ -166,7 +180,7 @@
     <span id="align-text"></span>
     <button type="button" class="btn primary" id="align-confirm">정렬 완료</button>
   </div>
-  <div class="banner warn" id="paused-banner" hidden>자동 진행 일시정지 중입니다. 진행 중인 단계는 끝까지 수행한 뒤 멈춥니다.</div>
+  <div class="banner warn" id="paused-banner" hidden>서버가 자동 진행 일시정지 상태입니다. 이 화면에는 재개 버튼이 없습니다(런북 6절).</div>
 
   <div class="kpis">
     <div class="kpi"><span><i class="dot" id="b-left-dot"></i>왼팔 배터리</span><strong id="b-left">-</strong><small id="b-left-sub">-</small></div>
@@ -179,52 +193,51 @@
   <div class="board">
     <div class="col">
       <section class="card flat">
-        <div class="card-head"><h2>미션 단계</h2><span class="tag" id="fsm-tag">대기</span></div>
+        <div class="card-head"><h2>미션 단계</h2>
+          <span class="row-actions">
+            <span class="row-actions" id="test-tools" hidden>
+              <button type="button" class="btn small" id="t-step">한 단계 진행</button>
+              <button type="button" class="btn small" id="t-fail">실패 주입</button>
+              <button type="button" class="btn small" id="t-reset" hidden>데모 초기화</button>
+            </span>
+            <span class="tag" id="fsm-tag">대기</span>
+          </span>
+        </div>
         <div class="current-head" id="current-head"></div>
         <div class="fsm" id="phases"></div>
       </section>
 
-      <div class="lists">
-        <section class="card">
-          <div class="card-head"><h2>대기열 <span class="muted" id="queue-count"></span></h2><span class="tag">수락 → START</span></div>
-          <div class="table-wrap"><table>
-            <thead><tr><th>주문 번호</th><th>테이블</th><th>메뉴</th><th>상태</th><th></th></tr></thead>
-            <tbody id="queue"></tbody>
-          </table></div>
-        </section>
-
-        <section class="card">
-          <div class="card-head"><h2>실패 원인 기록</h2></div>
-          <div class="table-wrap"><table>
-            <thead><tr><th>주문 번호</th><th>결과</th><th>시각</th><th>실패 원인</th></tr></thead>
-            <tbody id="history"></tbody>
-          </table></div>
-        </section>
-      </div>
-
       <section class="card flat">
-        <div class="form">
-          <h2>대리 주문</h2>
-          <select id="f-table" aria-label="테이블"></select>
-          <select id="f-drink" aria-label="음료">
-            <option value="COLD_WATER">냉수</option>
-            <option value="HOT_WATER">온수</option>
-            <option value="LEMONADE">레몬에이드</option>
-            <option value="COLA">콜라</option>
-          </select>
-          <button type="button" class="btn primary" id="f-submit">미션 등록</button>
-          <span class="msg" id="f-msg"></span>
-          <span class="row-actions" id="test-tools" hidden>
-            <button type="button" class="btn small" id="t-step">한 단계 진행</button>
-            <button type="button" class="btn small" id="t-fail">실패 주입</button>
-            <button type="button" class="btn small" id="t-reset" hidden>데모 초기화</button>
-          </span>
-        </div>
-        <div class="table-wrap staff-wrap" id="staff-wrap" hidden><table>
+        <div class="card-head"><h2>대기열 <span class="muted" id="queue-count"></span></h2><span class="tag">수락 → START</span></div>
+        <div class="table-wrap queue-wrap"><table>
+          <thead><tr><th>주문 번호</th><th>테이블</th><th>메뉴</th><th>상태</th><th></th></tr></thead>
+          <tbody id="queue"></tbody>
+        </table></div>
+      </section>
+
+      <section class="card flat" id="staff-card" hidden>
+        <div class="table-wrap staff-wrap"><table>
           <thead><tr><th>주문 번호</th><th>테이블</th><th>직원 서빙 <span id="staff-count"></span></th><th></th></tr></thead>
           <tbody id="staff"></tbody>
         </table></div>
       </section>
+
+      <div class="tech">
+        <section class="card">
+          <div class="card-head"><h2>ROS 2 토픽</h2><span class="tag" id="topic-tag">-</span></div>
+          <div class="table-wrap"><table><tbody id="topics"></tbody></table></div>
+          <p class="note" id="topic-note"></p>
+        </section>
+        <section class="card">
+          <div class="card-head"><h2>백엔드 명령 로그</h2><span class="tag" id="cmd-count">0</span></div>
+          <ol class="log" id="commands"></ol>
+          <p class="note" id="manip-note"></p>
+        </section>
+        <section class="card">
+          <div class="card-head"><h2>이벤트 기록</h2></div>
+          <ol class="log" id="events"></ol>
+        </section>
+      </div>
     </div>
 
     <div class="col">
