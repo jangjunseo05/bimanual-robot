@@ -1,52 +1,26 @@
 <!--
-  Transit through several waypoints as one goal (2026-10-01: separate
-  NavigateToPose legs slowed to a stop and turned at every waypoint). Replan
-  only when the path became invalid, is 10 s old, or the goals changed; a
-  passed waypoint (within 0.25 m) is dropped first. The last pose keeps its
-  yaw through the general goal checker.
--->
-<!--
-  RPP copy of navigate_through_poses_transit.xml as it ran until 2026-10-05 (box_service rpp-transit switch, A/B and fallback).
--->
-<!--
-  A passed waypoint is dropped on every 1 Hz tick, ahead of the replan check, and the
-  changed goals replan at once (GlobalUpdatedGoal). 2026-10-06 16:48: dropped only
-  when a replan ran (every 10 s), the base passed home_exit 0.16 m away between two
-  replans, the next path led back to it, and RPP turned around about 180 deg at each
-  following replan for 80 s (eleven in-place turns, about 800 deg).
+  NavFn plans the transit route once. A transient planner failure waits one
+  second before retrying, but a successful path is never recomputed during
+  this goal. RPP stops on a controller failure, waits, and restarts that same
+  path. The parent executor keeps the sensor and cancellation guards.
 -->
 <root BTCPP_format="4" main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <RecoveryNode number_of_retries="1" name="Transit">
-      <PipelineSequence>
-        <RateController hz="1.0">
-          <Sequence>
-            <ForceSuccess>
-              <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.25"/>
-            </ForceSuccess>
-            <Fallback>
-              <ReactiveSequence>
-                <Inverter>
-                  <PathExpiringTimer seconds="10" path="{path}"/>
-                </Inverter>
-                <Inverter>
-                  <GlobalUpdatedGoal/>
-                </Inverter>
-                <IsPathValid path="{path}"/>
-              </ReactiveSequence>
-              <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="GridBased" error_code_id="{compute_path_error_code}" server_timeout="3000"/>
-            </Fallback>
-          </Sequence>
-        </RateController>
-        <FollowPath path="{path}" controller_id="FollowPath" goal_checker_id="general_goal_checker" error_code_id="{follow_path_error_code}" server_timeout="3000"/>
-      </PipelineSequence>
-      <Sequence>
-        <Fallback>
+    <Sequence name="PlanOnceThenFollowTransitPath">
+      <RecoveryNode number_of_retries="60" name="ComputeTransitPathRetry">
+        <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="GridBased" error_code_id="{compute_path_error_code}" server_timeout="3000"/>
+        <Sequence name="WaitForTransitPlanner">
           <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+          <Wait wait_duration="1.0"/>
+        </Sequence>
+      </RecoveryNode>
+      <RecoveryNode number_of_retries="60" name="FollowTransitPathRetry">
+        <FollowPath path="{path}" controller_id="FollowPath" goal_checker_id="general_goal_checker" error_code_id="{follow_path_error_code}" server_timeout="3000"/>
+        <Sequence name="WaitForTransitController">
           <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
-        </Fallback>
-        <Wait wait_duration="1.0"/>
-      </Sequence>
-    </RecoveryNode>
+          <Wait wait_duration="1.0"/>
+        </Sequence>
+      </RecoveryNode>
+    </Sequence>
   </BehaviorTree>
 </root>

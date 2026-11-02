@@ -253,10 +253,10 @@ def test_reference_alignment_respects_abort_conditions(monkeypatch, case):
     node._observe_rear_box.assert_not_called()
 
 
-@pytest.mark.parametrize('clear', [True, False])
+@pytest.mark.parametrize('clear, exact_clear', [(True, True), (False, False), (False, True)])
 @pytest.mark.parametrize('has_reference', [True, False])
 def test_lateral_drift_uses_one_static_checked_curve_to_twenty_cm_handoff(
-        monkeypatch, clear, has_reference):
+        monkeypatch, clear, exact_clear, has_reference):
     node = node_with_reference()
     if not has_reference:
         del node._rear_dock_reference
@@ -269,12 +269,14 @@ def test_lateral_drift_uses_one_static_checked_curve_to_twenty_cm_handoff(
         for x, y in (physical[:2], (.19, .02))]))
     node._footprint_outline = Mock(return_value=[(-.275, -.225), (.065, .225)])
     check = Mock(return_value=clear)
+    check.last_blockage = {'grid': 'map'}
+    monkeypatch.setattr(module, 'static_corridor_clear', Mock(return_value=exact_clear))
     monkeypatch.setattr(module, 'CachedStaticCorridorValidator', Mock(return_value=check))
     node._odom_pose = Mock(return_value=physical)
     node._frozen_in_odom = Mock(return_value=(None, lambda x, y, yaw: (x, y, yaw)))
     node._odom_path = Mock(return_value='frozen landmark curve')
     node._execute_reverse_once = Mock(return_value=True)
-    if not clear:
+    if not clear and not exact_clear:
         with pytest.raises(RuntimeError, match='static corridor blocked'):
             node._center_rear_box(observation, .275)
         node._execute_reverse_once.assert_not_called()
@@ -290,7 +292,7 @@ def test_lateral_drift_uses_one_static_checked_curve_to_twenty_cm_handoff(
     node._execute_reverse_once.assert_called_once()
     assert node._execute_reverse_once.call_args.kwargs['final'] is False
     assert node._execute_reverse_once.call_args.kwargs['goal_checker_id'] == 'entry_heading_checker'
-    assert 'position_handoff_m' not in node._execute_reverse_once.call_args.kwargs
+    assert node._execute_reverse_once.call_args.kwargs['position_handoff_m'] == .015
 
 
 @pytest.mark.parametrize('gap_m', [.85, .89, .9, .99, 1.])

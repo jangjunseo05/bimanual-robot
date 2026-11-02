@@ -664,3 +664,70 @@ def test_destroy_stops_worker_before_ros_node(monkeypatch):
 
     assert not worker.is_alive()
     destroyed.assert_called_once_with()
+
+
+def test_three_consistent_near_tape_views_replace_challenged_goal_without_arrival():
+    node = _node()
+    contact = Mock()
+    node.station_reference = _rgbd_model(contact_reference=contact,
+                                        observation_method='table_front_tape')
+    node.station_reference_profile = {'lateral_tolerance_m': .005}
+    node.station_reference_mode = 'rgbd'
+    node.parking_contract['yaw_tolerance_rad'] = .03
+    old = {'valid': True, 'stamp_s': 9., 'goal_odom': [.4, 0., 0.]}
+    node._station_reference_goal_samples = deque([dict(old)]*3, maxlen=5)
+    node.station_reference_goal = dict(old)
+    node.station_reference_goal_frozen = True
+    node._station_terminal_goal = dict(old)
+    node.parking_tf = Mock()
+    node.parking_tf.lookup_transform.return_value = SimpleNamespace(transform=_pose())
+    node._odom_pose = Mock(return_value=(.39, 0., 0.))
+    for index, lateral in enumerate((.070, .072, .071)):
+        stamp = 10. + index * .4
+        node.get_clock.return_value = _clock(stamp+.1)
+        node.station_reference.observe.return_value = {
+            'valid': True, 'stamp_s': stamp, 'goal_odom': [.4, lateral, .015],
+            'goal_left_offset_m': 0.,
+            'quality': {'tape_center_base_xy_m': [.2, lateral]},
+        }
+        node._station_reference_pending = (None, None, stamp)
+        node._station_reference_stop.clear()
+        # Stop after a single worker iteration, including repeated statuses.
+        node._station_reference_reported_status = None
+        node.emit.side_effect = lambda *_a, **_kw: node._station_reference_stop.set()
+        node._station_reference_wake.set()
+        node._station_reference_loop()
+        node._fresh_station_reference = lambda: node.station_reference_result
+        if index < 2:
+            node._station_goal_reference(freeze=True)
+            assert node._station_terminal_goal is None
+            assert not node._table_terminal_reference_ready(node.station_reference_result)
+            assert node.station_reference_goal['goal_odom'] == old['goal_odom']
+    node.emit.side_effect = None
+    goal, _ = node._station_goal_reference(freeze=True)
+    assert goal['goal_odom'] == pytest.approx([.4, .071, .015])
+    assert node._table_rebase_requires_restage
+    assert node._table_restage_tape_goal['goal_odom'] == goal['goal_odom']
+    assert not node._table_terminal_reference_ready(node.station_reference_result)
+    assert node._station_terminal_goal is None
+    assert contact.restore_tracking.call_count == 2
+    assert node._station_lateral_status()['lateral_reference_valid'] is False
+
+
+@pytest.mark.parametrize('bad', ['duplicate', 'stale', 'far', 'outlier', 'not_tape'])
+def test_tape_rebase_does_not_accept_unconfirmed_frames(bad):
+    node = _node()
+    node.station_reference = SimpleNamespace(observation_method='table_front_tape')
+    def sample(stamp, y=.071):
+        return dict(valid=True, stamp_s=stamp, goal_odom=[.4,y,0.],
+                    image_age_at_completion_s=.1,
+                    quality={'tape_center_base_xy_m': [.2,y]})
+    assert node._consider_tape_rebase(sample(10.)) is None
+    assert node._consider_tape_rebase(sample(10.3)) is None
+    third = sample(10.6)
+    if bad == 'duplicate': third['stamp_s'] = 10.3
+    if bad == 'stale': third['image_age_at_completion_s'] = 10.
+    if bad == 'far': third['quality']['tape_center_base_xy_m'][0] = .8
+    if bad == 'outlier': third['goal_odom'][1] = -.07
+    if bad == 'not_tape': node.station_reference.observation_method = 'cup_bottle'
+    assert node._consider_tape_rebase(third) is None

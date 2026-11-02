@@ -266,6 +266,33 @@ def test_return_clearance_uses_guarded_motion_without_a_departure_waypoint(
         node._depart_dock_straight(.2)
 
 
+@pytest.mark.parametrize('refresh', [True, False])
+def test_return_clearance_refreshes_scan_without_accepting_stale_input(
+        dock_departure_static_corridor, monkeypatch, refresh):
+    node = dock_departure_route()
+    node.emit = Mock()
+    node.registry['home'] = {'rear_parking_reference': 'lidar_box'}
+    node.run_deadline_s = 10.0
+    node.waypoints = [{'id': 'home_dock_approach', 'x': 0.1, 'y': 0.0}]
+    node.config = {**node.config, 'waypoints': node.waypoints}
+    clock = [0.0]
+    monkeypatch.setattr(restaurant_service.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(restaurant_service, 'spin_node',
+                        lambda *_a, **_k: clock.__setitem__(0, clock[0] + .1))
+    snapshot = object()
+    node._scan_in_base = Mock(side_effect=lambda: snapshot if refresh and clock[0] else None)
+    node._footprint_intrusion = Mock(return_value=None)
+    node._rear_swing_need = Mock(return_value=0.0)
+    assert node._clear_rear_dock_straight(.2) is refresh
+    assert clock[0] <= restaurant_service.ESCAPE_SCAN_MAX_AGE_S
+    if refresh:
+        node._footprint_intrusion.assert_called_once_with(found=snapshot)
+        node._execute_reverse_once.assert_called_once()
+    else:
+        node._footprint_intrusion.assert_not_called()
+        node._execute_reverse_once.assert_not_called()
+
+
 @pytest.mark.parametrize('blocked,stopped,failed', [
     (True, False, False), (False, True, False), (False, False, True)])
 def test_return_clearance_preserves_obstacle_stop_and_action_failure(
@@ -990,10 +1017,10 @@ def test_reverse_follow_path_preserves_verifier_and_terminal_outcome(status, con
     assert node._verify_parking_stop.called is (status == GoalStatus.STATUS_SUCCEEDED)
 
 
-@pytest.mark.parametrize('case', ['handoff', 'outside', 'stop', 'link', 'nav', 'cancel_failed'])
+@pytest.mark.parametrize('case', ['handoff', 'outside', 'stop', 'link', 'nav', 'cancel_failed', 'arrived_abort'])
 def test_intermediate_reverse_position_handoff_keeps_abort_and_cancel_checks(monkeypatch, case):
     node = reverse_route()
-    running = SimpleNamespace(done=Mock(side_effect=[False, True]), result=Mock(
+    running = SimpleNamespace(done=Mock(side_effect=([True] if case == 'arrived_abort' else [False, True])), result=Mock(
         return_value=SimpleNamespace(status=GoalStatus.STATUS_ABORTED,
                                      result=SimpleNamespace(error_code=105))))
     accepted = handle(future=running)
@@ -1027,7 +1054,7 @@ def test_intermediate_reverse_position_handoff_keeps_abort_and_cancel_checks(mon
         with pytest.raises(RuntimeError, match='cancellation unconfirmed'):
             node._execute_reverse_once(path, **kwargs)
     else:
-        assert node._execute_reverse_once(path, **kwargs) is (case == 'handoff')
+        assert node._execute_reverse_once(path, **kwargs) is (case in ('handoff', 'arrived_abort'))
     node.finish_navigation.assert_called_once()
     node._verify_parking_stop.assert_not_called()
     if case == 'handoff':
@@ -2670,17 +2697,19 @@ def test_blocked_leg_is_held_then_retried(monkeypatch):
     """A person in the aisle: hold PATH_BLOCKED_WAIT_S, then retry the same leg."""
     _fast_clock(monkeypatch)
     node = route()
+    node._front_clear = Mock(return_value=True)
     tries, attempt = _blocked_attempts(node, blocked_tries=2)
     assert node._run_with_input_recovery(attempt) is True
     assert len(tries) == 3
     waits = [e for e in _events(node) if e['event'] == 'path_blocked_wait']
     assert [e['wait'] for e in waits] == [1, 2]
-    assert waits[0]['wait_s'] == corridor_route.PATH_BLOCKED_WAIT_S
+    assert waits[0]['wait_s'] is None
 
 
 def test_blocked_leg_gives_up_after_the_retry_budget(monkeypatch):
     _fast_clock(monkeypatch)
     node = route()
+    node._front_clear = Mock(return_value=True)
     tries, attempt = _blocked_attempts(node, blocked_tries=99)
     assert node._run_with_input_recovery(attempt) is False
     assert len(tries) == corridor_route.PATH_BLOCKED_RETRIES + 1
@@ -2762,15 +2791,15 @@ def test_no_path_hold_ends_as_soon_as_a_plan_exists(monkeypatch):
     assert len(cleared) == 1 and cleared[0]['held_s'] < corridor_route.PATH_BLOCKED_WAIT_S
 
 
-def test_controller_stop_backs_away_before_each_hold(monkeypatch):
+def test_controller_stop_waits_without_backing_away(monkeypatch):
     _fast_clock(monkeypatch)
     node = route()
     node._path_open = Mock(return_value=True)
-    node._front_clear = Mock(return_value=False)
+    node._front_clear = Mock(side_effect=[False, True, True, False, True, True])
     node._escape_blocked = Mock(return_value=True)
     tries, attempt = _blocked_attempts(node, blocked_tries=2, code=105)
     assert node._run_with_input_recovery(attempt) is True
-    assert node._escape_blocked.call_count == 2
+    node._escape_blocked.assert_not_called()
     node._path_open.assert_not_called()           # a 105 hold runs its full time
 
 
@@ -3550,7 +3579,7 @@ def test_controller_block_retries_the_leg_on_the_same_rpp_trees(monkeypatch):
 
     assert node._run_with_input_recovery(recording_attempt) is True
     assert trees == ['staging_rpp.xml', 'staging_rpp.xml']
-    assert node._escape_blocked.call_args.args == (1,)
+    node._escape_blocked.assert_not_called()
     assert not any(e['event'] == 'recovery_controller' for e in _events(node))
 
 
@@ -3861,6 +3890,11 @@ def test_filtered_blind_memory_uses_one_current_pose_snapshot(monkeypatch):
 
     assert len(found) == 1 and found[0] == pytest.approx((.19, 0.0))
     node._odom_pose.assert_called_once_with()
+    source_pose, source_scan, point, current = node._blind_point_sources[0]
+    assert source_pose == (0., 0., 0.)
+    assert source_scan is scan
+    assert point == pytest.approx((.39, 0.))
+    assert current == (.20, 0., 0.)
 
 
 def test_escape_snapshot_needs_a_fresh_scan_and_carries_the_blind_memory(monkeypatch):
@@ -4309,7 +4343,7 @@ def test_live_depth_gap_waits_stopped_and_resumes_same_target(monkeypatch, inter
 
 @pytest.mark.parametrize('failure', [
     'rear box face unavailable', 'rear box target changed',
-    'rear docking swept footprint occupied'])
+    'rear docking swept footprint occupied', 'table approach tape reference pending'])
 @pytest.mark.parametrize('recovers', [True, False])
 def test_rear_input_gap_keeps_same_motion_and_respects_task_deadline(
         monkeypatch, failure, recovers):
@@ -4338,17 +4372,18 @@ def test_rear_input_gap_keeps_same_motion_and_respects_task_deadline(
     monkeypatch.setattr(restaurant_service.time, 'monotonic', lambda: clock[0])
     monkeypatch.setattr(restaurant_service.rclpy, 'spin_once', spin)
     result = node._drive_zero_turn(.04, precision=True, hold_heading=True, target_update=update)
-    waiting = next(e for e in _events(node) if e['event'] == 'rear_box_waiting_for_input')
+    prefix = 'table_approach' if failure.startswith('table ') else 'rear_box'
+    waiting = next(e for e in _events(node) if e['event'] == f'{prefix}_waiting_for_input')
     assert waiting['target_preserved']
     assert all(v == 0. for t, v in commands if waiting['monotonic_s'] <= t < 11.5)
     assert clock[0] < 14.6
     if recovers:
         assert result == pytest.approx(.04, abs=.003)
-        assert any(e['event'] == 'rear_box_input_recovered' for e in _events(node))
+        assert any(e['event'] == f'{prefix}_input_recovered' for e in _events(node))
     else:
         assert result is None
         assert position[0] < .02
-        assert not any(e['event'] == 'rear_box_input_recovered' for e in _events(node))
+        assert not any(e['event'] == f'{prefix}_input_recovered' for e in _events(node))
 
 
 @pytest.mark.parametrize('intermediate', [True, False])
@@ -4486,3 +4521,16 @@ def test_rotation_without_valid_scan_never_starts_motion(monkeypatch):
     assert node._rotate_in_place(.3) is None
     node._direct_motion.assert_not_called()
     assert node._last_direct_motion_failure == 'rotation scan unavailable'
+
+
+def test_obstacle_wait_does_not_restart_when_old_wait_duration_expires(monkeypatch):
+    _fast_clock(monkeypatch, step_s=5)
+    node = route()
+    node._front_clear = Mock(side_effect=[False] * 12 + [True, True])
+    node._escape_blocked = Mock()
+    tries, attempt = _blocked_attempts(node, blocked_tries=1, code=105)
+    assert node._run_with_input_recovery(attempt) is True
+    assert len(tries) == 2
+    node._escape_blocked.assert_not_called()
+    cleared = [e for e in _events(node) if e['event'] == 'path_blocked_cleared']
+    assert cleared[0]['held_s'] > corridor_route.PATH_BLOCKED_WAIT_S

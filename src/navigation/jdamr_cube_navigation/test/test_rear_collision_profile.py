@@ -478,3 +478,19 @@ def test_rotation_watch_stops_on_stale_scan_but_passes_zero_and_clear_turn(monke
     assert watch(command(angular=.3)) == 'rotation scan stale or future-dated'
     assert watch(command()) is None
     assert monitor.sets == []
+
+
+def test_remembered_collision_records_original_scan_and_pose(monkeypatch):
+    route, _monitor, _clock = node(monkeypatch, memory=[(-.281, .051)])
+    original = scan([(-.5,.05)], stamp_s=9.)
+    route._blind_point_sources = [((1.,2.,.1), original, (-.5,.05), (1.2,2.,.1))]
+    with module.rear_collision_profile(route) as watch:
+        assert watch(command(linear=-.05)) == 'rear docking swept footprint occupied'
+    events = [call.kwargs for call in route.emit.call_args_list
+              if call.args[0] == 'rear_collision_witness']
+    origin = events[0]['remembered_source']
+    assert origin['pose_odom'] == [1.,2.,.1]
+    assert origin['point_base_xy_m'] == [-.5,.05]
+    assert origin['scan_stamp_s'] == 9.
+    assert len(origin['ranges']) == len(original.ranges)
+    assert None in origin['ranges']  # JSON has no Infinity literals

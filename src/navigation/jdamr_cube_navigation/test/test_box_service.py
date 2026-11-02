@@ -4238,3 +4238,35 @@ def test_tape_retreat_clears_old_endpoint_and_samples():
     assert node.station_reference_control_goal is None
     assert not node.station_reference_goal_frozen
     assert not node._station_reference_goal_samples
+
+
+@pytest.mark.parametrize('reason,count,frozen,expected', [
+    ('tape_pair_missing', 3, True, True),
+    ('tape_pair_missing', 1, True, False),
+    ('tape_pair_missing', 3, False, False),
+    ('station_reference_stale', 3, True, False),
+    ('station_reference_not_observed', 3, True, False),
+    ('camera_disconnected', 3, True, False),
+])
+def test_terminal_tape_hold_requires_accepted_goal_and_current_input(reason, count, frozen, expected):
+    node = object.__new__(BoxServiceRoute)
+    node.station_reference = SimpleNamespace(observation_method='table_front_tape')
+    node.station_reference_goal = {'valid': True, 'goal_filter_sample_count': count}
+    node.station_reference_goal_frozen = frozen
+    assert node._table_terminal_reference_ready({'valid': False, 'reason': reason}) is expected
+
+
+def test_accepted_tape_goal_latches_in_near_band_when_pair_leaves_view(monkeypatch):
+    node, _clock, update, _lookup = _moving_table_route(monkeypatch)
+    node.station_reference = SimpleNamespace(observation_method='table_front_tape')
+    node.station_reference_mode = 'rgbd'
+    node.station_reference_profile = {'lateral_tolerance_m': .005}
+    goal = {'valid': True, 'goal_odom': [.455,.001,0.], 'stamp_s': 10.1,
+            'goal_filter_sample_count': 3}
+    node.station_reference_goal = goal
+    node.station_reference_goal_frozen = True
+    missing = {'valid': False, 'reason': 'tape_pair_missing', 'stamp_s': 10.2}
+    node._station_goal_reference = Mock(return_value=(goal,missing))
+    update((.44,0.,0.))
+    assert node._station_terminal_goal['goal_odom'] == goal['goal_odom']
+    assert node._continuous_table_stop['basis'] == 'aligned_face_frozen_for_precision_band'

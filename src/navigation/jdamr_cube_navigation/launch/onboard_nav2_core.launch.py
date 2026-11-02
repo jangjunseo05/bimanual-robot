@@ -331,7 +331,7 @@ def _launch_navigation(context):
         'collision_monitor', 'bt_navigator',
     ]
     required_nodes = list(DEFAULT_REQUIRED)
-    if profile in {'obstacle_candidate', 'obstacle_base_candidate',
+    if profile in {'corridor', 'obstacle_candidate', 'obstacle_base_candidate',
                    'new_base_candidate', 'new_base_revisit_candidate'}:
         # Ordinary transit keeps Wait only. Precision service can expose Spin
         # for explicit bounded search actions, never automatic backup/recovery.

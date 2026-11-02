@@ -1,0 +1,50 @@
+[
+  {
+    "run": "water_station_20261101_125748_7e3efb3b",
+    "reason": "table lateral alignment requires more clearance",
+    "start_pose_odom": [
+      2.4010449451063973,
+      -0.645364520508224,
+      -0.12052864715763438
+    ],
+    "face_center_odom": [
+      2.8309761288843633,
+      -0.601611452547041
+    ],
+    "outward_normal_odom": [
+      -0.9998997439942158,
+      0.014159871478993502
+    ],
+    "lateral_goal_odom": [
+      2.7514500928425663,
+      -0.5656175512498107,
+      0.004119866835537778
+    ],
+    "front_extent_m": 0.065,
+    "half_width_m": 0.225
+  },
+  {
+    "run": "water_station_20261101_145733_f09e3bae",
+    "reason": "table lateral alignment requires more clearance",
+    "start_pose_odom": [
+      4.97556567421152,
+      -1.9753604641181015,
+      -0.39492086017065725
+    ],
+    "face_center_odom": [
+      5.343929369035287,
+      -2.0864227690700887
+    ],
+    "outward_normal_odom": [
+      -0.955578689949845,
+      0.29473609774463994
+    ],
+    "lateral_goal_odom": [
+      5.299083993365883,
+      -1.970370159074523,
+      -0.2936451885332685
+    ],
+    "front_extent_m": 0.065,
+    "half_width_m": 0.225
+  }
+]

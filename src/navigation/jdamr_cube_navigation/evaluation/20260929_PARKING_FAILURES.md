@@ -2137,3 +2137,10 @@ sudo systemctl stop jdamr-box-observer jdamr-box-rgbd jdamr-ammr-dashboard
   이어가기, 20 cm 어긋난 도착에서 face-alignment 재배치 후 테이블1 좌우 결과(정렬 허용 5 cm + AMCL), 회전 공간 후진이
   충돌 감시와 겹치지 않는지, 1 cm 미세 보정의 전후 교대 소멸. 후면 대기 65 s와 이동 중 RGB 작업자 부하는
   `20261029_DRIVE_TIMING_REVIEW.md` 4절의 측정 후 결정 항목이다.
+
+## 2026-10-31 도크 전진 여유 시작 전 스캔 공백
+
+- 근거: `table_01_20261031_182702_46ed27ea/cycle_events.jsonl`, 18:27:53 rear_dock_center_clearance(0.802729m, lateral -0.066279m) → 18:27:54 rear_dock_clearance_started → 0.011초 후 release_failed(no fresh scan) → rear_box_parking_not_confirmed. 실제 도크 도착은 팀원 보고이고 내부 최종 주차 확인은 없다.
+- 확인한 결함: 경로를 준비한 뒤 snapshot을 단 한 번 조회하고 None이면 즉시 종료한다. None은 scan 없음/수신나이0.5초초과/TF·outline·memory 실패를 모두 포함해 당시 원인은 분리되지 않았다. 해당 구간 직전 rear box face stable 기록이 있어 전체 라이다 고장으로 단정하지 않는다.
+- 수정: 정지 상태에서 최대 기존 freshness window0.5초 동안 콜백을 처리해 유효 snapshot 재취득. 기존 입력 신선도·충돌·중단·deadline 유지. 재취득 불가 시 scan_present와 scan_callback_age_s 기록. 후진 완료를 임의 성공으로 바꾸지 않는다.
+- 확인: 단발 공백 뒤 회복과 지속 무입력을 포함한 관련6개 확인 통과. Pi 백업 후 모듈 교체 및 해시 일치. 실제 주행·도킹은 수행하지 않았으며 좌우 보정 전진 거리의 적절성과 실차 재발 여부는 남은 확인이다.

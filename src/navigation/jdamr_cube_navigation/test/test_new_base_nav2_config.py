@@ -156,8 +156,8 @@ def test_stop_zone_has_requested_geometric_margin():
         max(abs(point[1]) for point in stop)
         - max(abs(point[1]) for point in footprint),
     )
-    # Leading edge 0.05 m; rear and sides at the padded footprint (2026-10-01).
-    assert margins == pytest.approx((0.05, 0.0, 0.0))
+    # Front clearance is 0.40 m from the physical body; padding is 0.005 m.
+    assert margins == pytest.approx((0.395, 0.0, 0.0))
     assert stop_zone['type'] == 'velocity_polygon'
     assert stop_zone['velocity_polygons'] == [
         'rotation', 'rotation_clockwise', 'translation_forward_straight',
@@ -182,7 +182,7 @@ def test_stop_zone_has_requested_geometric_margin():
     assert _inside(rotation, (-0.27, -0.243), False)     # 11:09 leg in the padding
     forward = yaml.safe_load(stop_zone['translation_forward']['points'])
     assert max(point[0] for point in forward) == pytest.approx(
-        max(point[0] for point in footprint) + 0.05)
+        max(point[0] for point in footprint) + 0.395)
     assert max(abs(point[1]) for point in forward) == pytest.approx(
         max(abs(point[1]) for point in footprint))
     backward = yaml.safe_load(stop_zone['translation_backward']['points'])
@@ -856,7 +856,7 @@ def test_stop_zone_below_requested_margin_is_rejected(tmp_path):
     stop_zone['stopped']['points'] = points
     narrowed = tmp_path / 'below_margin.yaml'
     narrowed.write_text(yaml.safe_dump(document), encoding='utf-8')
-    with pytest.raises(RuntimeError, match='margin is below 0.05m'):
+    with pytest.raises(RuntimeError, match='margin is below approved clearance'):
         _load_validator(narrowed)(None)
 
 
@@ -1299,7 +1299,7 @@ def test_mppi_must_keep_the_speed_limit_and_footprint_costs(tmp_path, mutate):
 
 
 def test_transit_and_staging_default_to_lattice_and_mppi_with_rpp_copies():
-    """2026-10-05: Lattice (NavFn when it finds nothing) + MPPI; RPP kept as _rpp copies."""
+    """Keep RPP selection while its stop-wait recovery diverges from MPPI."""
     document = yaml.safe_load(PARAMS.read_text(encoding='utf-8'))
     assert 'MPPI' in document['controller_server']['ros__parameters']['controller_plugins']
     trees = ROOT / 'jdamr_cube_navigation/behavior_trees'
@@ -1327,19 +1327,25 @@ def test_transit_and_staging_default_to_lattice_and_mppi_with_rpp_copies():
         assert lattice[:start] in body(f'{name}_navfn_mppi.xml')
     for name in ('navigate_through_poses_transit_rpp.xml', 'navigate_to_pose_staging_rpp.xml'):
         assert 'controller_id="FollowPath"' in (trees / name).read_text()
-    # The RPP staging copy plans with NavFn only (2026-10-06 16:21: Lattice looped past
-    # the dock) and differs from the NavFn + MPPI one only in the controller.
+    # RPP plans with NavFn only and now keeps a successful path while the
+    # controller stops and waits; MPPI retains its periodic replan contract.
     assert planners('navigate_to_pose_staging_rpp.xml') == ['GridBased']
     rpp = body('navigate_to_pose_staging_rpp.xml')
-    assert rpp.replace('controller_id="FollowPath"', 'controller_id="MPPI"') == body(
-        'navigate_to_pose_staging_navfn_mppi.xml')
+    assert 'number_of_retries="60"' in rpp
+    assert '<Wait wait_duration="1.0"/>' in rpp
+    assert 'ClearEntireCostmap' not in rpp
+    assert 'PathExpiringTimer' not in rpp
+    mppi_staging = body('navigate_to_pose_staging_navfn_mppi.xml')
+    assert rpp.replace(
+        'controller_id="FollowPath"', 'controller_id="MPPI"') != mppi_staging
 
 
-@pytest.mark.parametrize('name', ['navigate_through_poses_transit.xml',
-                                  'navigate_through_poses_transit_navfn_mppi.xml',
-                                  'navigate_through_poses_transit_rpp.xml'])
+@pytest.mark.parametrize('name', [
+    'navigate_through_poses_transit.xml',
+    'navigate_through_poses_transit_navfn_mppi.xml',
+])
 def test_transit_drops_a_passed_waypoint_on_every_tick(name):
-    """2026-10-06 16:48: dropped only at a replan, a passed waypoint pulled the base back."""
+    """Replanning transit trees drop passed goals before planning again."""
     from xml.etree import ElementTree as ET
     root = ET.parse(ROOT / 'jdamr_cube_navigation/behavior_trees' / name).getroot()
     rate = next(root.iter('RateController'))
@@ -1384,7 +1390,7 @@ def _points(zone, name, transform):
                           lambda x, y: [-0.053 if x == 0.0 else x, y]), 'end at the axle'),
     # A shorter leading edge than the general forward polygon.
     (lambda zone: _points(zone, 'translation_forward_straight',
-                          lambda x, y: [0.10 if x == 0.12 else x, y]), 'end at the axle'),
+                          lambda x, y: [0.10 if x == 0.465 else x, y]), 'end at the axle'),
     # Narrower than the wheels: misses part of the footprint half ahead of the axle.
     (lambda zone: _points(zone, 'translation_forward_straight',
                           lambda x, y: [x, math.copysign(0.26, y) if abs(y) == 0.275 else y]),
@@ -1422,19 +1428,19 @@ def test_a_groove_between_perimeter_samples_is_rejected(tmp_path):
 
 def test_a_narrowed_front_band_is_rejected(tmp_path):
     """Review 2026-10-06: the band x 0.07-0.12 cut to |y| <= 0.05 passed the front-X check."""
-    general = [[0.12, 0.05], [0.07, 0.05], [0.07, 0.23], [0.038, 0.23], [0.038, 0.275],
+    general = [[0.465, 0.05], [0.07, 0.05], [0.07, 0.23], [0.038, 0.23], [0.038, 0.275],
                [-0.038, 0.275], [-0.038, 0.23], [-0.172, 0.23], [-0.172, 0.275],
                [-0.248, 0.275], [-0.248, 0.23], [-0.28, 0.23], [-0.28, -0.23],
                [-0.248, -0.23], [-0.248, -0.275], [-0.172, -0.275], [-0.172, -0.23],
                [-0.038, -0.23], [-0.038, -0.275], [0.038, -0.275], [0.038, -0.23],
-               [0.07, -0.23], [0.07, -0.05], [0.12, -0.05]]
-    straight = [[0.12, 0.05], [0.07, 0.05], [0.07, 0.23], [0.038, 0.23], [0.038, 0.275],
+               [0.07, -0.23], [0.07, -0.05], [0.465, -0.05]]
+    straight = [[0.465, 0.05], [0.07, 0.05], [0.07, 0.23], [0.038, 0.23], [0.038, 0.275],
                 [0.0, 0.275], [0.0, -0.275], [0.038, -0.275], [0.038, -0.23],
-                [0.07, -0.23], [0.07, -0.05], [0.12, -0.05]]
+                [0.07, -0.23], [0.07, -0.05], [0.465, -0.05]]
     path = _write_stop_zones(tmp_path, {
         'stopped': general, 'translation_forward': general,
         'translation_forward_straight': straight}, 'narrow_band.yaml')
-    with pytest.raises(RuntimeError, match='misses the 0.05m front band'):
+    with pytest.raises(RuntimeError, match='misses the approved front band'):
         _load_validator(path)(None)
 
 

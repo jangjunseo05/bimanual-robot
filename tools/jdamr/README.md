@@ -61,8 +61,10 @@ tools/jdamr/jdamr_depart.py go water_station
 다른 포인터는 전역 옵션 `--map-session <전체 경로>` 또는 `JDAMR_MAP_SESSION`으로 지정한다.
 `prepare`는 현재 등록 도크·급수대·테이블로 실행 자산을 만들고, 원본 지도·등록 파일·
 도크 스캔·RGB-D 참조를 Pi에 동기화한 뒤 지도 포인터를 마지막에 반영한다.
-`session-start`는 기존 Astra 드라이버 한 개에서 RGB와 깊이를 함께 받도록 설정하고,
-Nav2를 이동 전 준비 상태로 기동한다. `init`은 등록 도크를 다시 가르치지 않고 위치를 초기화한다.
+`session-start`는 Windows Astra TCP 수신기와 관측기를 유지하고,
+Nav2를 이동 전 준비 상태로 기동한다. Windows 연결 구성에서는 Pi 베이스의
+`15-astra-usb-recover.conf` 의존성을 사용하지 않는다. Pi에 없는 카메라를 USB로
+복구하려는 대기가 베이스 기동을 지연시키기 때문이다. `init`은 등록 도크를 다시 가르치지 않고 위치를 초기화한다.
 도크 원본과 현재 스캔을 0.5° 간격으로 비교하고, 양쪽의 공통 지지점으로 정합한다.
 대체 위치에는 같은 최적 지지점을 고정해 비교한다. 등록 도크 범위 안의 작은
 평행이동 모호성은 초기 공분산에 반영하고 실제 AMCL 수렴·기존 자세 일치 조건을 확인한다.
@@ -75,6 +77,11 @@ Pi 베이스 서비스는 `jdamr_cube_navigation/real_bringup_imu.launch.py`로 
 바이어스 보정 자이로를 합친다. 원시 바퀴 odom은 `/wheel/odom`, 보정 IMU는 `/imu/data`,
 제어에 쓰는 odom은 EKF의 `/odom`이다. 드라이버의 odom TF 발행은 끄고 EKF만
 `odom→base_footprint`를 발행한다. 가속도는 융합하지 않으며 AMCL의 `map→odom` 역할은 유지한다.
+Pi의 Nav2·실행기·초기화 도구는 패키지 `config/fastdds_udp_loopback.xml`과
+`ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET`을 함께 사용한다. XML의 `127.0.0.1`
+제한으로 Pi 내부 UDP만 사용하며, `LOCALHOST`가 추가하는 공유메모리 전송을 피한다.
+베이스도 같은 XML과 `discovery_range:=SUBNET`을 사용한다. Pi에서는
+`/etc/systemd/system/jdamr-base.service.d/99-loopback-udp.conf`에 적용돼 있다.
 기존 `jdamr_cube_bringup/real_bringup.launch.py`는 바퀴 odom 단독 구성으로 남아 있다.
 IMU는 회전 추정을 보완하며, 면을 따라 움직인 실제 좌우 위치를 독립 측정하지 않는다.
 

@@ -21,8 +21,32 @@ camera_mount:
   table_edge_calibration:
     enabled: true
     status: derived
-    yaw_offset_rad: 0.004432522739111133
-    plane_offset_bias_m: 0.06079043842230575
+    yaw_offset_rad: -0.008122875370698527
+    plane_offset_bias_m: 0.05408828864565839
+    field_recheck_20261101:
+      measured_at: '2026-11-01'
+      unit: m_rad
+      valid_for: current_Astra_mount_water_station_front_edge
+      source: teammate_external_corner_measurements_and_matching_run
+      run_id: water_station_20261101_155334_43bfd97d
+      status: provisional_single_pose_fit_pending_physical_recheck
+      external_left_gap_m: 0.005
+      external_right_gap_m: 0.0
+      internal_corner_order:
+      - right
+      - left
+      internal_corner_gaps_m:
+      - 0.009523118098105243
+      - 0.008873292060912932
+      corner_spacing_m: 0.45
+      front_extent_m: 0.065
+      prior_yaw_offset_rad: 0.004432522739111133
+      prior_plane_offset_bias_m: 0.06079043842230575
+      yaw_delta_rad: -0.01255539810980966
+      plane_offset_delta_m: -0.006702149776647355
+      method: yaw = asin((right-left)/width); offset = mean(corner_gaps) + front_extent*cos(yaw);
+        add external-minus-internal deltas
+      independent_accuracy_verified: false
     reference_transform:
       x_m: -0.275
       y_m: 0.0

@@ -274,6 +274,24 @@ def test_face_heading_is_corrected_before_a_large_straight_clearance(interrupted
     node._clear_rear_dock_straight.assert_not_called()
 
 
+
+def test_rear_heading_overshoot_reduces_next_command():
+    node = route_node()
+    initial = face(.2, math.radians(6.4))
+    overshot = face(.2, math.radians(-7.1))
+    aligned = face(.2, math.radians(1.))
+    for observation in (initial, overshot, aligned):
+        observation.update(normal_odom=(1., 0.), face_odom=(-.475, 0.))
+    node.stop_requested = False
+    node._operator_link_ready = Mock(return_value=True)
+    node._guard_failure = Mock(return_value=None)
+    node._rotate_in_place = Mock(return_value=.1)
+    node._observe_rear_box_recovering = Mock(side_effect=[overshot, aligned])
+    node.emit = Mock()
+    assert node._align_rear_face_before_clearance(initial, GEOMETRY, .275, .225) is aligned
+    commands = [call.args[0] for call in node._rotate_in_place.call_args_list]
+    assert commands == pytest.approx([math.radians(6.4), math.radians(-7.1) * 6.4 / 13.5])
+
 def face(gap=0.01, angle=0.0, stamp=5.0):
     normal = math.cos(angle), math.sin(angle)
     tangent = -normal[1], normal[0]
@@ -1027,3 +1045,75 @@ def test_fresh_corner_confirmation_can_end_filtered_rear_approach(raw_gap, angle
         assert result['remaining_m'] == 0.
     else:
         assert result['remaining_m'] > 0.
+
+
+def test_centering_aligns_skewed_face_before_rejecting_midpoint_residual(monkeypatch):
+    node = route_node()
+    initial, skewed, aligned = face(.77), face(.139, .379), face(.2)
+    for observed in (initial, skewed, aligned):
+        observed.update(normal_odom=(1.,0.), face_odom=(-.475,0.))
+    skewed['midpoint_odom'] = (-.475, .099)
+    aligned['midpoint_odom'] = (-.475, 0.)
+    for name in ('verify_live_maps','_confirm_collision_monitor_on'):
+        setattr(node,name,Mock())
+    for name in ('wait_until_ready','_reverse_smoother_ready','_parking_parameters_ready'):
+        setattr(node,name,Mock(return_value=True))
+    monkeypatch.setattr(module,'_rear_center_curve_available',lambda *_a: True)
+    node._observe_rear_box_recovering = Mock(side_effect=[initial,skewed])
+    def center(*_a):
+        node._rear_center_moved = True
+        return True
+    node._center_rear_box = center
+    order=[]
+    node._align_rear_face_before_clearance = Mock(side_effect=lambda *_a: order.append('align') or aligned)
+    node._odom_pose = Mock(return_value=(0.,.003,0.))
+    node._park_rear_face = Mock(side_effect=lambda *_a: order.append('fine') or True)
+    node.emit = Mock()
+    assert node.park_rear_box(GEOMETRY,'route',execute=True,timeout_s=90,target_gap_m=.01)
+    assert order == ['align','fine']
+    assert node._park_rear_face.call_args.args[0] is aligned
+
+
+def test_small_lateral_offset_at_57cm_skips_curve():
+    node = route_node()
+    observed = face(.57)
+    observed.update(observation_roi_clipped=False, midpoint_odom=(-.845,0.), normal_odom=(1.,0.))
+    node._odom_pose = Mock(return_value=(0.,.003,0.))
+    node.emit = Mock()
+    node._make_reverse_path = Mock(side_effect=AssertionError('unnecessary curve'))
+    assert module.RearBoxParkingMixin._center_rear_box(node,observed,.275)
+    assert node._rear_center_skipped and not node._rear_center_moved
+
+
+@pytest.mark.parametrize('angle', [-.0466, 0., .0466])
+@pytest.mark.parametrize('sign', [-1., 1.])
+def test_longer_reverse_curve_avoids_forward_clearance_at_five_cm_offset(angle, sign):
+    # Nov 2 log: gap=1-.507577504, lateral=-.058358623. The initial
+    # orientation was not logged; bracket it with explicit synthetic +/-2.67deg.
+    normal = math.cos(angle), math.sin(angle)
+    tangent = -normal[1], normal[0]
+    gap, lateral, extent = .492422496, sign*.058358623, .275
+    midpoint = tuple(-(gap+extent)*normal[i]-lateral*tangent[i] for i in (0,1))
+    observed = face(gap, angle)
+    observed.update(normal_odom=normal, midpoint_odom=midpoint, face_odom=midpoint,
+                    base_pose_odom=(0.,0.,0.), observation_roi_clipped=False)
+    with pytest.raises(ValueError, match='tighter than min_radius_m'):
+        module.reverse_curve_waypoints((0.,0.,0.), module._rear_center_target(observed,extent))
+    selected = module._rear_center_curve_gap(observed,extent)
+    assert selected in (.15,.1)
+    path = module.reverse_curve_waypoints(
+        (0.,0.,0.), module._rear_center_target(observed,extent,selected))
+    assert path[-1] == pytest.approx(module._rear_center_target(observed,extent,selected))
+    node = route_node()
+    for name in ('verify_live_maps','_confirm_collision_monitor_on'):
+        setattr(node,name,Mock())
+    for name in ('wait_until_ready','_reverse_smoother_ready','_parking_parameters_ready'):
+        setattr(node,name,Mock(return_value=True))
+    node.emit = Mock()
+    node._observe_rear_box_recovering = Mock(return_value=observed)
+    node._clear_rear_dock_straight = Mock(side_effect=AssertionError('unnecessary forward'))
+    node._align_rear_face_before_clearance = Mock(side_effect=AssertionError('unnecessary rotation'))
+    node._park_rear_face = Mock(return_value=True)
+    assert node.park_rear_box(GEOMETRY,'route',execute=True,timeout_s=90,target_gap_m=.01)
+    node._clear_rear_dock_straight.assert_not_called()
+    node._center_rear_box.assert_called_once_with(observed, pytest.approx(extent))

@@ -4,6 +4,72 @@
 
 ---
 
+## 2026-11-02 | 급수대·도크 실차 확인 및 후면 불필요한 전진 수정
+
+- 원격 main fetch/pull 결과 f7edff8로 최신,11/1 팀원 신규 원격 커밋/PR 없음. 기존 팀원 water_service.py/water_service_api.py 미커밋 변경 보존.
+- Pi 새 세션 기동·등록 도크 스캔 기반 init 완료. inlier0.43, AMCL 대조6mm. 배터리12.452V. Collision Monitor lifecycle active, StopZone=true/min_points3, FootprintApproach=true, SlowdownZone=false 확인. cmd_vel_smoothed→collision_monitor→cmd_vel→base_driver 연결 확인.
+- Windows Astra USB 장치는 OK였지만 Python 송신기가 없었음. 현재 기준 저장소의 카메라 브리지만 기동, Pi 수신 약10fps/깊이 영상 나이약0.10초/시계 RTT약2.2ms 확인. 팔 실행기·주문·추론은 기동하지 않음.
+- 사용자 요청 급수대→도크 시험 run `water_station_20261102_090031_4ea5b452`: 급수대 box_approach_finished 후 도크 복귀 도중 사용자가 사람 접근에도 정지되지 않는다고 보고. 에이전트 긴급정지 개입. 이 실행을 전체 왕복 성공으로 기록하지 않는다. 사용자 후속 복귀 지시로 정지·명령 종료 확인→reset→dock-only 실행.
+- dock-only `water_station_20261102_090322_6f0efc17`: home_arrived confirmed=true. 후면 라이다 내부 nearest7.911mm/farthest9.423mm/yaw-0.1925도, 외부 실측 미확인. 근처 gap0.492422496m/lateral-0.058358623m에서20cm 관측 목표의 곡선 반경 부족으로0.507577504m 전진 후 중앙 곡선→후면 주차. 고정20cm 목표 때문에 불필요한 전후진 발생 확인.
+- 수정: 곡선 인계 후보20/15/10cm를 순서대로 계산해 기존 최소 회전반경을 만족하는 가장 먼 인계점 선택. 중심 이동 직전 현재 odom으로 다시 계산. 기존 static swept corridor/실시간 충돌/동일 면 재관측/최종1cm 조건 유지. 관련83개 실행 확인 통과, 위 거리/좌우와 명시적 합성각±2.67도에서 전진 없이 곡선 가능 확인. 수정 후 실차 재시험은 하지 않음.
+- Pi 원본 해시 HEAD 일치·spool 비어 있음 확인 후 백업 `~/jdamr_deploy/backups/rear_continuous_20261102_090822`, rear_box_service.py 교체. SHA256730f9cda4a9e8e2cb94ba5ae6fe2e0ba921d8959fbf542b84f60b79f1708cfc2. 실행기 재시작 PID5338→10429 active/running.
+- CM 기록 `~/jdamr_data/collision_trials/20261102_090034.jsonl`: StopZone 판정2구간, 이 중1표본은 nonzero 입력에서 output0. 사용자가 접근한 시점/위치와 동기화한 근거가 없어 사람 끼어들기 정지시험 통과로 판정하지 않음. 넓은 감속영역 OFF/차체 근접 정지영역이라는 현재 정책을 설명했으며 범위 수정은 아직 하지 않음. 원본 사본은 PC `~/jdamr_data/handoffs/parking_20261102/`. 임시 기록기 PID6696 종료 확인.
+- 다음 실차 확인을 위해 Nav2·실행기·Pi AST1 수신기와 Windows 카메라 송신기는 유지. Windows 카메라 Python PID27572(launcher2640), 로그 `%USERPROFILE%\jdamr_logs\astra_20261102_085929.log`; 종료는 PowerShell `Stop-Process -Id 27572`, 짝 수신기는 Pi `systemctl --user stop jdamr-astra-tcp.service`. 이동 세션 종료는 PC `python3 ~/bimanual-robot/tools/jdamr/jdamr_depart.py session-stop`. 새 물리 이동 없음.
+
+## 2026-11-01 | 14회차 주방 근접 테이프 재기준·13회차 도크 기억점 근거 보존
+
+- 팀원 보고: 12회차 전체 성공, 13회차 도크 실패, 14회차 주방 실패. 주방 `water_station_20261101_184228_239cc532`에서 근접 테이프 관측이 기존 고정 목표와 약7cm 차이나 `station_reference_inconsistent_static_goal`로 폐기됨을 로그로 확인. 기존 static 비교가 새 관측끼리의 합의를 고려하지 않은 것은 코드로 확인했으며, 고정 목표 편향의 원인이 바퀴 미끄러짐인지는 미확정.
+- 주방 수정: 유효·신선·서로 다른 근접 테이프3장(차체 x0.05~0.45m,2초 창)이 목적지 XY1cm/방향2도 이내로 일치하면 median XY·원형평균 방향으로 odom 목적지를 재기준. 첫 불일치부터 terminal 완료를 보류하고, 합의 후 좌우오차가 기존 허용치를 넘으면 기존 clearance 후진→측면 재정렬→접근으로 연결. 근접 접근 분기도 동일 복구 경로를 사용. 합의되지 않은 관측·오래된 영상·테이프 누락으로 재기준하지 않는다. 충돌·센서·최종1cm 조건과 방문별 재시도 한도 유지.
+- 도크 `table_01_20261101_183004_7d7ae121`: 기억점(-0.280536,+0.051418),(-0.288817,-0.015692)이 후면 경계1~9mm 밖에서 정지 예측에 걸림. 기존 기록에는 그 점의 원본 scan/pose가 없어 상자 면인지 별도 낮은 물체인지 판별 불가. 새 `rear_collision_witness.remembered_source`에 원본 scan/pose/point·현재 pose·laser transform을 기록하도록 추가. 충돌점 제외·기억점 삭제는 하지 않음. 외부 실측값이 없는 후면 접촉 편차는 임의 보정하지 않았으며 미해결로 남김.
+- 변경 관련 최소 실행 확인115개 통과(테이프 worker 합의/반례/terminal, 재기준→후진→측면 재정렬, 도크 기억점 provenance/보호, 입력 복구). Nav2 경로 추종과 실제 주차 성공은 실차 미확인. 확장 실행 중 설치 prefix 미설정으로 launch3건 실패, 기존 no_scan fixture에 run_deadline_s가 없어1건 실패를 확인했고 이번 변경의 통과 수에 포함하지 않음. 전체 테스트 통과 주장은 하지 않는다.
+- Pi4파일 배포 전 HEAD 해시 일치 및 실행 요청/실행 중 spool 없음 확인. 백업 `~/jdamr_deploy/backups/parking_14_20261101_190432`. system `jdamr-box-executor.service` 재시작 PID7467→19974 active/running. 새 주행·팔 동작 명령 없음.
+- 팀원 미커밋 `tools/jdamr/water_service.py`, `tools/jdamr/water_service_api.py` 보존. 로컬 목적 브랜치 커밋만 진행하고 원격 push는 하지 않음.
+
+## 2026-11-01 | 11회차 도크 곡선 조기 인계·주방 terminal hold·실측 편차 보정
+
+- 팀원 결과: 주문261101010 SUCCEEDED / 미션20261101_173634_e9abe2b3. 서빙 완료, 최종 후면 도킹 실패. 주문 성공을 전체 왕복 도킹 성공으로 집계하지 않는다.
+- 도크 근거 `table_01_20261101_174119_a3059423`: 곡선 시작 후3.909초에5cm XY handoff, 재관측 gap0.139m/yaw0.379rad/좌우-0.09884m로 실패. 이른 인계를 넣은 앞선 수정이 곡선을 조기에 끝낼 수 있음을 확인. 보이는 span 변화가 midpoint 편차에 기여한 크기는 미확정.
+- 수정: 진행 중 XY 인계를1.5cm로 축소(105 결과에서도 동일 XY/입력 조건 확인). 인계 후 같은 면의 각도를 정렬·재관측한 다음 좌우 잔차 판정. 좌우 허용범위 안이고 gap<=0.58m이면 곡선 생략 후 면 방향을 맞추고 정밀 진입(0.6m fine travel bound 여유 유지). 도크 최종 두 모서리1cm±3mm 조건 유지, 각도·모서리 차를 confirmation에 명시. 폭0.45m에서 모서리 차6mm 조건은 약0.764도이며 잘못된 자세를 confirmed로 바꾸지 않는다.
+- 주방9회차 `water_station_20261101_155334_43bfd97d`: frozen tape goal은 있으나 tape_pair_missing으로 terminal hold 미설정→station_lateral_arrival_unconfirmed. 11회차 `water_station_20261101_173637_d19f61c0`는 gap0.027647m에서 hold. Pi와 로컬 비교 결과 추가 terminal 수정은 들어가 있지 않았다.
+- terminal 수정: 3개 이상 유효 관측으로 수용·고정한 테이프 목표는 현재 영상이 신선한 tape_pair_missing일 때도 근거리 정렬 완료 후 hold 가능. 3~15cm 사이의 hold 공백도 제거. stale/연결끊김/미관측 목표는 인정하지 않으며 깊이·odom·충돌·최종간격 조건 유지.
+- 주방 보정: 실제 mount yaw0, 별도 table_edge_calibration yaw+0.00443252rad/bias0.06079044m 확인. 9회차 외부 실측 왼쪽0.005m·오른쪽0m와 같은 run 내부 corner gaps[0.0095231181,0.0088732921]를 대조. 코드 배열은 [오른쪽,왼쪽]이며 yaw 로그는 절댓값이다. 같은 pose의 양 모서리에서 signed yaw와 법선거리를 재산출해 task yaw -0.0125553981rad(-0.71937도), distance -0.0067021498m 보정. 새 task값 yaw -0.0081228754rad / bias0.0540882886m. 실제 camera transform은 변경하지 않음. config field_recheck_20261101에 원자료·계산식 기록, 한 회차 잠정 보정이며 독립 실차 정확도 미검증. 11회차 외부 좌우 수치가 완전하지 않아 추가 피팅에는 사용하지 않음.
+- 관련131개 확인 통과. 57cm/좌우3mm 곡선 생략, 기울어진 중앙 관측의 정렬 후 판정, fresh missing-pair terminal hold, 무목표/stale 거부, 기존 후면 보호, 보정값의 원측정 재현 포함. 실물 주행/팔 실행 없음.
+- Pi 백업 `~/jdamr_deploy/backups/parking_11_20261101_180043/`. box_service/rear_box_service 해시 로컬 일치, config source·deploy camera_mount_current·runtime camera_mount의 보정값 일치. system jdamr-box-executor 재시작18:00:46 KST, PID2322→7467 active/running. 큐/진행 요청 없는 상태에서 반영. 다음 실제 실행의 결과는 아직 미확인.
+
+
+## 2026-11-01 | 급수대 테이프 오차 보존·실제 좌우 재정렬
+
+- 우선순위 변경: 실물 시연 급수대 정렬을 우선. 사용자 보고6회 중2회 실패. 도크 후속 수정은 하지 않았다.
+- 실패 근거: `water_station_20261101_125748_7e3efb3b`, `water_station_20261101_145733_f09e3bae`의 Pi cycle_events.jsonl. 거부→후진에서 수용한 테이프 목표와 표본을 삭제하고, 재정렬 판단/계획은 재관측 지도 목표를 사용해 테이프 좌우 오차를 놓쳤다. 지도 기준 좌우가 작다는 사실은 테이프 정렬 성공이 아니다.
+- 수정: preview 거부 당시 실제 사용한 수용 테이프 목표를 odom에 보존(좌우·방향 오차와 당시 pose 기록). 해당 방문의 제한된 재정렬에서만 후진 뒤 목표·표본을 유지한다. 현재 map↔odom 변환으로 테이프 목표를 재투영하고, 새 깊이 면의 접선 방향 목표를 그 위치로 옮겨 Nav2 face_alignment를 수행한다. 재정렬 목표 map 좌표·원본 odom 목표도 이벤트로 기록한다. 다음 방문은 보존값 초기화.
+- 센서/충돌/최종 간격 계약 유지: 보존 좌표는 목적지일 뿐 신선한 관측이나 완료 증거가 아니다. 후진 경로 검사, Nav2 충돌 정지, 새 깊이 입력과 최종1cm 조건 유지. 테이프 한 줄 영상에서 새 짝을 꾸며내지 않는다.
+- 최소 확인33개 통과. 실제 두 로그 거부 geometry→후진→옆 방향 재정렬 목표→기존 접근 preview 통과 확인. 사용자 제공+7.8cm/-8.0도 및+9.8cm/-6.2도도 합성20cm 최근접 간격에서 확인(요약에 거리 없으므로 가정 명시). map y 원점0/16cm 조건 포함. Nav2 이동/정적지도는 mock이며 실제 경로 추종/실차 정밀도를 증명하지 않는다. 기존 충돌·정지·깊이·간격 관련 최소 확인 포함.
+- Pi box_service.py 수정 전 로컬baseline과 동일 확인, 백업 `~/jdamr_deploy/backups/kitchen_tape_restage_20261101_153053/box_service.py`. 배포 SHA256 `7af0e6ec06cfae1a96669b55beb9ffb2203c7ed933bf7104711bd8ef775eb631` 로컬 일치.
+- 실행기는 system 서비스임을 확인. queued/running 요청 없음 확인 후 `sudo systemctl restart jdamr-box-executor.service` 실행. 15:30:55 KST PID17762→20191, active/running 확인. 사용자 서비스 조회만으로 실행기가 꺼졌다고 판단하지 않는다. 새 주행·팔 동작 명령 없음. 실차 급수대 재시험은 아직 하지 않았다.
+- 목적 브랜치 `fix/amr-kitchen-tape-restaging`. 팀원 미커밋 water_service.py/water_service_api.py 보존. 원격 push는 하지 않았다.
+
+
+## 2026-11-01 | 후면 중앙 접근의 위치 인계·각도 반전 보정
+
+- 사용자 전달: 주문261101004·261101005에서 급수대→물따르기→테이블1→컵배치까지 2회 연속 통과. 최종 후면 도킹은 남아 있어 전체 왕복 완료2회로 집계하지 않는다.
+- `git pull --ff-only origin main`: 이미 최신(f7edff8). 로컬 팀원 water_service.py / water_service_api.py 미커밋 변경은 보존. 두 주행 모듈의 Pi 원본은 수정 전 HEAD와 같았으며, 다른 Pi 파일은 덮어쓰지 않았다.
+- 근거: Pi runtime/runs/table_01_20261101_135128_f55cf262/cycle_events.jsonl에서 rear_dock_centering accepted→14.514초 뒤 status6/code105. 실측은 사용자 전달 왼쪽21.5cm/오른쪽18cm. 종료 시 odom 목표 오차가 기록되지 않아 'XY 도달 후 yaw만 실패'는 가설이다.
+- 수정: 후면 중앙 접근에 기존 5cm 중간 XY 인계를 연결. 도달 즉시 action 종료 확인 후 같은 면 재관측·좌우 잔차 확인·면 각도 정렬로 이어간다. 결과가 먼저105로 끝난 경우에도 유효한 현재 입력과 XY 도달이 확인될 때만 같은 인계를 허용한다. 최종1cm 주차 완료로 간주하지 않는다. 취소·통신·센서·충돌 보호 유지.
+- 두 번째 근거: table_01_20261101_132726_67df2079에서 면 각도+6.36도→-7.11도로 반전 후 미수렴. 구동 과회전과 관측 오차의 기여도는 미확정. 같은 면 재관측에서 부호가 뒤집히면 관측 반응 비율로 다음 회전 명령을 감쇠(이득0.25~1), 최대4회 내 기존3도 중간 정렬 기준 유지. 명령각·잔차·다음 이득을 추가 기록한다.
+- 최소 동작 확인14개 통과, diff 확인, Pi 문법 및 실제 import 경로의 두 파일 SHA 일치. Pi 백업: ~/jdamr_deploy/backups/dock_center_20261101/. 서비스 재시작·로봇/팔 이동 없음. 다음 새 실행에서 적용되며 실차 도킹 성공은 미확인. 이번 두 로그는 clearance 단계 전 실패로, 기존 no fresh scan 수정 효과를 검증한 것은 아니다.
+
+
+## 2026-10-31 | 팀원 통합 시험 결과 인계·도크 스캔 공백 수정
+
+- 팀원 보고: 웹 START 자동 출발과 급수대 주차 정상, 새 노트북 물따르기 첫 성공1회/64.7초. 테이블 주차·컵배치 통합 미시험, 전체 완주0회. 이는 사용자에게 전달받은 결과이며 로컬 로그만으로 팔 성공을 재판정하지 않는다.
+- `tools/jdamr/water_service.py`, `water_service_api.py`의 웹 START/STOP 추종·heartbeat 변경86줄은 팀원 미커밋 작업이다. 파일별 SHA와 사본을 `$HOME/jdamr_data/handoffs/20261031_team_web_changes/`에 보존했다. fetch만 수행하고 pull·덮어쓰기·팀원 변경 커밋은 하지 않았다. 팀원 PR 반영 전 git checkout으로 두 파일을 되돌리지 않는다.
+- `table_01_20261031_182702_46ed27ea`: 도크 후면 관측/접근 후 좌우 오차-0.0663m에 대한 전진 여유0.8027m를 준비했다. 준비 시작→0.011초 뒤 `_scan_in_base()`가 None이라 release_failed, 상위 rear_box_parking_not_confirmed로 종료. 그 직전에는 stable face로 직진을 종료했다. 실제 라이다 단절·TF 부재·경로 준비 중 콜백 지연 중 어느 것인지는 당시 세부 로그가 없어 확정하지 않는다. 전진80cm나 최종도킹은 이 기록에서 실행 완료되지 않았다.
+- 수정: 전진 여유 시작 전 유효 snapshot이 없으면 정지 상태에서 기존0.5초 freshness window 동안 콜백을 처리해 새 snapshot을 재취득한다. 입력 나이/충돌 기준은 유지하며 사용자 정지·run deadline을 우선한다. 실패 시 scan 존재·콜백 나이를 기록해 원인을 분리한다. 관련6개 최소 확인 통과, Pi 기존 파일 해시와 baseline 일치 확인 후 백업·교체·문법·해시 확인. 실행기/주행 세션은 중지 상태를 유지했고 로봇·팔 이동 없음. 실차 재발 해소는 아직 미확인.
+- session-start code3: 팀원이 보존한 Pi `~/jdamr_deploy/backups/jdamr-restaurant-navigation.service.20261031_180843` 및 중지 transient 삭제 기록을 확인. 현재 Nav2 unit은 not-found/inactive로 잔존 unit 없음. 당시 start 거부 원문은 확보하지 못해 stale unit/설정 identity 불일치를 확정 원인으로 쓰지 않는다. 추가 유닛 삭제·재시작은 하지 않았다.
+- 저녁 run `20261031_200402_beac093c/controller.log`4096바이트 중간 절단 확인. 디스크 부족 보고와 부합하지만 ENOSPC 원문/해당 code120 stderr가 없어 원인은 미확정. 현재 /home 여유2.1GB(97%) 관측, 용량 정리는 사용자 별도 작업으로 아무 파일도 삭제하지 않았다.
+- 이 PC에 jdamr-water-service-api.service unit과 serve 프로세스는 현재 발견되지 않았다. 웹 자동출발을 임의로 다시 켜지 않았다. 내일 Windows 모델 ready·카메라송신과 기존 주문/긴급정지 상태를 확인한 뒤 도크에서 prepare→session-start→init, 주행 PC에서 `python3 tools/jdamr/water_service_api.py serve --order-url http://192.168.0.157:8765 --follow-web`을 한 번 실행한다. 웹 START가 실제 팔 접기·출발을 시작하므로 serve 준비와 구분한다. 주소 변경 시 새 주소 사용. 실차 준비 완료 판정은 아직 하지 않는다.
+
+
 ## 2026-10-30 | 도크 출발·급수대 주차·물따르기 진행 확인 후 노트북 전원 종료
 
 - 미션 `20261030_210526_c0191d20`, 주문 `261030002`. 도크 스캔 기반 초기화 후 급수대 주차 `water_station_20261030_210536_aa2379a4` 완료, 21:06:49 kitchen 정렬 완료 전달. Windows GRASP_CUP / running_policy=pour 확인.

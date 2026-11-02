@@ -161,15 +161,20 @@ parking_contract_path() {
 }
 
 session_identity() {
-  local asset_hashes digest parking_contract
+  local asset_hashes digest parking_contract transport_hash=""
   parking_contract=$(parking_contract_path)
   absolute_file "$parking_contract" "주차 contract"
   asset_hashes=$(sha256sum -- "$REGISTRY" "$PARAMS_FILE" "$parking_contract" \
     "${BASH_SOURCE[0]}") || \
     die "세션 설정 해시 계산 실패"
+  if [ -n "${FASTRTPS_DEFAULT_PROFILES_FILE:-}" ]; then
+    absolute_file "$FASTRTPS_DEFAULT_PROFILES_FILE" "DDS profile"
+    transport_hash=$(sha256sum -- "$FASTRTPS_DEFAULT_PROFILES_FILE") || \
+      die "DDS profile 해시 계산 실패"
+  fi
   digest=$(printf '%s\0' "$WORKSPACE" "$REGISTRY" "$PARAMS_FILE" \
     "$PRECISION_PARKING" "$PREPARE_ONLY" "$USE_COMPOSITION" "$DISCOVERY_RANGE" \
-    "$asset_hashes" | sha256sum) || \
+    "$asset_hashes" "$transport_hash" | sha256sum) || \
     die "세션 식별자 계산 실패"
   printf '%s' "${digest%% *}"
 }
@@ -217,7 +222,38 @@ reuse_inactive_navigation() {
     die "$UNIT가 이 스크립트가 만든 transient unit인지 확인할 수 없다; 기존 unit을 변경하지 않았다"
   expected="JDAMR_RESTAURANT_SESSION_ID=$identity"
   if [[ " $environment " != *" $expected "* ]]; then
-    die "$UNIT 중지 설정이 요청과 다르다; 기존 unit을 변경하지 않았다"
+    # A completed transient session can outlive its configuration. Release only
+    # our inactive unit, then let start_navigation create the requested version.
+    [[ " $environment " == *" JDAMR_RESTAURANT_INTERNAL=1 "* ]] || \
+      die "$UNIT 중지 설정의 소유 표식을 확인할 수 없다; 기존 unit을 변경하지 않았다"
+    # Preserve the owned fragment before --collect can remove it on StopUnit.
+    local backup_dir
+    [ "$(systemctl show "$UNIT" --property=ActiveState --value)" = inactive ] || \
+      die "$UNIT 해제 중 상태가 변경됐다; 기존 unit을 변경하지 않았다"
+    backup_dir=$(mktemp -d "${TMPDIR:-/tmp}/jdamr-retired-session.XXXXXX") || \
+      die "종료된 세션 백업 경로 생성 실패"
+    sudo -n cp -- "$fragment_path" "$backup_dir/$UNIT" || \
+      die "종료된 세션 설정 보존 실패"
+    printf '%s\n' "이전 세션 설정 보존: $backup_dir/$UNIT"
+    sudo -n systemctl stop "$UNIT" || die "$UNIT 중지된 세션 해제 실패"
+    sudo -n systemctl reset-failed "$UNIT" 2>/dev/null || true
+    [ "$(systemctl show "$UNIT" --property=ActiveState --value)" = inactive ] || \
+      die "$UNIT 해제 중 상태가 변경됐다; 기존 unit을 변경하지 않았다"
+    # A referenced inactive unit may retain its fragment; an already collected
+    # fragment is equally valid here. Never remove persistent or active units.
+    sudo -n rm -f -- "$fragment_path" || die "종료된 세션 설정 해제 실패"
+    sudo -n systemctl daemon-reload || die "systemd 세션 설정 갱신 실패"
+    local attempt released
+    for attempt in {1..10}; do
+      released=$(systemctl show "$UNIT" --property=LoadState --value) || \
+        die "$UNIT 해제 결과 조회 실패"
+      if [ "$released" = not-found ]; then
+        printf '%s\n' "$UNIT의 종료된 이전 설정을 해제했다. 새 설정으로 생성한다."
+        return 1
+      fi
+      sleep 0.2
+    done
+    die "$UNIT 종료된 이전 설정이 남아 있다; 새 세션을 중복 생성하지 않았다"
   fi
 
   check_ros_graph_and_sensors
@@ -286,7 +322,7 @@ start_navigation() {
   fi
   check_ros_graph_and_sensors
 
-  local script_path run_user precision_argument=() prepare_argument=()
+  local script_path run_user precision_argument=() prepare_argument=() transport_environment=()
   script_path=$(readlink -f "${BASH_SOURCE[0]}") || die "스크립트 경로 확인 실패"
   run_user=$(id -un) || die "실행 사용자 확인 실패"
   if [ "$PRECISION_PARKING" = true ]; then
@@ -294,6 +330,9 @@ start_navigation() {
   fi
   if [ "$PREPARE_ONLY" = true ]; then
     prepare_argument=(--prepare-only)
+  fi
+  if [ -n "${FASTRTPS_DEFAULT_PROFILES_FILE:-}" ]; then
+    transport_environment=(--setenv="FASTRTPS_DEFAULT_PROFILES_FILE=$FASTRTPS_DEFAULT_PROFILES_FILE")
   fi
   sudo -n systemd-run \
     --unit="$UNIT" --collect \
@@ -305,6 +344,7 @@ start_navigation() {
     --setenv="ROS_DISTRO=${ROS_DISTRO:-jazzy}" \
     --setenv=JDAMR_RESTAURANT_INTERNAL=1 \
     --setenv="JDAMR_RESTAURANT_SESSION_ID=$identity" \
+    "${transport_environment[@]}" \
     --working-directory="$WORKSPACE" \
     /bin/bash "$script_path" __run \
     --workspace "$WORKSPACE" --registry "$REGISTRY" --params-file "$PARAMS_FILE" \

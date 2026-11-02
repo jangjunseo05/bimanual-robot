@@ -1,27 +1,28 @@
-<!-- 복도 주행 BT. 앞으로만 가되 일시적 실패는 재시도한다.
-     회전·후진 복구는 상태를 불명확하게 만들므로 넣지 않고, 복구 수단은
-     코스트맵 초기화로 제한한다. server_timeout은 bt_navigator의 같은 이름
-     설정을 덮어쓰므로 두 실행값을 테스트에서 함께 검증한다. -->
+<!--
+  Corridor navigation plans once, then stops and waits on a transient failure
+  before restarting the same path. Recovery is bounded and never clears a
+  costmap, spins, backs up, or replans an already-created path.
+-->
 <root BTCPP_format="4" main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <RecoveryNode number_of_retries="6" name="NavigateRecovery">
-      <Sequence name="NavigateCorridorForwardOnly">
-        <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
-        <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
-        <GoalCheckerSelector selected_goal_checker="{selected_goal_checker}" default_goal_checker="position_goal_checker" topic_name="goal_checker_selector"/>
-        <RecoveryNode number_of_retries="3" name="ComputePathRetry">
-          <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}" server_timeout="3000"/>
-          <ClearEntireCostmap name="ClearGlobalBeforeReplan" service_name="global_costmap/clear_entirely_global_costmap"/>
-        </RecoveryNode>
-        <RecoveryNode number_of_retries="3" name="FollowPathRetry">
-          <FollowPath path="{path}" controller_id="{selected_controller}" goal_checker_id="{selected_goal_checker}" error_code_id="{follow_path_error_code}" server_timeout="3000"/>
-          <ClearEntireCostmap name="ClearLocalBeforeRetry" service_name="local_costmap/clear_entirely_local_costmap"/>
-        </RecoveryNode>
-      </Sequence>
-      <Sequence name="CorridorRecovery">
-        <ClearEntireCostmap name="ClearGlobalRecovery" service_name="global_costmap/clear_entirely_global_costmap"/>
-        <ClearEntireCostmap name="ClearLocalRecovery" service_name="local_costmap/clear_entirely_local_costmap"/>
-      </Sequence>
-    </RecoveryNode>
+    <Sequence name="PlanOnceThenFollowCorridorPath">
+      <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
+      <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
+      <GoalCheckerSelector selected_goal_checker="{selected_goal_checker}" default_goal_checker="position_goal_checker" topic_name="goal_checker_selector"/>
+      <RecoveryNode number_of_retries="60" name="ComputeCorridorPathRetry">
+        <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}" server_timeout="3000"/>
+        <Sequence name="WaitForCorridorPlanner">
+          <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+          <Wait wait_duration="1.0"/>
+        </Sequence>
+      </RecoveryNode>
+      <RecoveryNode number_of_retries="60" name="FollowCorridorPathRetry">
+        <FollowPath path="{path}" controller_id="{selected_controller}" goal_checker_id="{selected_goal_checker}" error_code_id="{follow_path_error_code}" server_timeout="3000"/>
+        <Sequence name="WaitForCorridorController">
+          <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+          <Wait wait_duration="1.0"/>
+        </Sequence>
+      </RecoveryNode>
+    </Sequence>
   </BehaviorTree>
 </root>

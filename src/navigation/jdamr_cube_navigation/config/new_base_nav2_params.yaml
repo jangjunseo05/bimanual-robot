@@ -560,7 +560,7 @@ collision_monitor:
         # A return inside the padded footprint behind the axle held every other
         # polygon, so the base could not drive away from it (2026-10-02 11:09:
         # a desk leg 1.3-2.0 cm beside the frame at the right rear corner).
-        points: '[[0.12, 0.23], [0.038, 0.23], [0.038, 0.275], [0.0, 0.275], [0.0, -0.275], [0.038, -0.275], [0.038, -0.23], [0.12, -0.23]]'
+        points: '[[0.465, 0.23], [0.038, 0.23], [0.038, 0.275], [0.0, 0.275], [0.0, -0.275], [0.038, -0.275], [0.038, -0.23], [0.465, -0.23]]'
         linear_min: 0.005
         linear_max: 0.2
         theta_min: -0.005
@@ -574,10 +574,10 @@ collision_monitor:
         theta_max: 0.005
       translation_forward:
         # Straight forward motion does not close lateral clearance. Keep the
-        # requested 50 mm at the leading edge, but do not add another lateral
+        # requested 400 mm from the physical front edge, but do not add another lateral
         # band outside the already padded costmap footprint. FootprintApproach
         # still projects the full swept footprint whenever the path turns.
-        points: '[[0.12, 0.23], [0.038, 0.23], [0.038, 0.275], [-0.038, 0.275], [-0.038, 0.23], [-0.172, 0.23], [-0.172, 0.275], [-0.248, 0.275], [-0.248, 0.23], [-0.28, 0.23], [-0.28, -0.23], [-0.248, -0.23], [-0.248, -0.275], [-0.172, -0.275], [-0.172, -0.23], [-0.038, -0.23], [-0.038, -0.275], [0.038, -0.275], [0.038, -0.23], [0.12, -0.23]]'
+        points: '[[0.465, 0.23], [0.038, 0.23], [0.038, 0.275], [-0.038, 0.275], [-0.038, 0.23], [-0.172, 0.23], [-0.172, 0.275], [-0.248, 0.275], [-0.248, 0.23], [-0.28, 0.23], [-0.28, -0.23], [-0.248, -0.23], [-0.248, -0.275], [-0.172, -0.275], [-0.172, -0.23], [-0.038, -0.23], [-0.038, -0.275], [0.038, -0.275], [0.038, -0.23], [0.465, -0.23]]'
         linear_min: 0.005
         linear_max: 0.2
         theta_min: -1.0
@@ -593,7 +593,7 @@ collision_monitor:
         # Last-entry fallback required by Collision Monitor. Sides and rear are the
         # padded footprint: the 5 cm band held the robot still beside the water box
         # with about 10 cm real clearance (2026-10-01).
-        points: '[[0.12, 0.23], [0.038, 0.23], [0.038, 0.275], [-0.038, 0.275], [-0.038, 0.23], [-0.172, 0.23], [-0.172, 0.275], [-0.248, 0.275], [-0.248, 0.23], [-0.28, 0.23], [-0.28, -0.23], [-0.248, -0.23], [-0.248, -0.275], [-0.172, -0.275], [-0.172, -0.23], [-0.038, -0.23], [-0.038, -0.275], [0.038, -0.275], [0.038, -0.23], [0.12, -0.23]]'
+        points: '[[0.465, 0.23], [0.038, 0.23], [0.038, 0.275], [-0.038, 0.275], [-0.038, 0.23], [-0.172, 0.23], [-0.172, 0.275], [-0.248, 0.275], [-0.248, 0.23], [-0.28, 0.23], [-0.28, -0.23], [-0.248, -0.23], [-0.248, -0.275], [-0.172, -0.275], [-0.172, -0.23], [-0.038, -0.23], [-0.038, -0.275], [0.038, -0.275], [0.038, -0.23], [0.465, -0.23]]'
         linear_min: -1.0
         linear_max: 1.0
         theta_min: -1.0

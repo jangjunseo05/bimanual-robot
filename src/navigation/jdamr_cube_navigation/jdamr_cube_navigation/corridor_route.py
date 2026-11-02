@@ -32,6 +32,7 @@ from rclpy.signals import SignalHandlerOptions
 from rclpy.utilities import remove_ros_args
 from sensor_msgs.msg import BatteryState, JointState, LaserScan
 from std_msgs.msg import Bool
+from std_srvs.srv import Empty
 from tf2_ros import Buffer, TransformException, TransformListener
 import yaml
 
@@ -712,7 +713,7 @@ class CorridorRoute(Node):
         Keep completed waypoints across retries of the current one.
 
         At most one retry after a fresh-input recovery, and up to
-        PATH_BLOCKED_RETRIES after holding PATH_BLOCKED_WAIT_S on a blocked path.
+        PATH_BLOCKED_RETRIES after confirmed clearance on a blocked path.
         """
         self._resume_waypoint_index = 0
         return self._retry_loop(attempt)
@@ -735,12 +736,8 @@ class CorridorRoute(Node):
                     return False
                 blocked_waits += 1
                 code = self._retry_blocked_code
-                if code not in PATH_BLOCKED_PLANNER_CODES:
-                    # The retry stays on the configured controller with a new plan:
-                    # the Lattice + MPPI retry ran four times on 2026-10-02, none
-                    # finished, and the escapes since then take the base off what
-                    # blocked it (operator 2026-10-06: drop MPPI).
-                    self._escape_blocked(blocked_waits)
+                # Obstacle recovery holds position; it never backs away or
+                # advances to manufacture clearance before waiting.
                 if not self._wait_for_path_clear(blocked, blocked_waits, code):
                     return False
                 continue
@@ -750,7 +747,7 @@ class CorridorRoute(Node):
 
     def _wait_for_path_clear(self, reason, wait, code=None):
         """
-        Hold still for PATH_BLOCKED_WAIT_S; stop early on an unrecoverable guard.
+        Hold still until clearance, cancellation, or an unrecoverable guard.
 
         Every PATH_BLOCKED_PROBE_S the hold checks whether it may end: without
         any path (PATH_BLOCKED_PLANNER_CODES) once a fresh plan exists, after a
@@ -758,11 +755,11 @@ class CorridorRoute(Node):
         times in a row.
         """
         self._report('path_blocked_wait', reason=reason, wait=wait,
-                     wait_s=PATH_BLOCKED_WAIT_S)
+                     wait_s=None)
         started_s = time.monotonic()
         probed_s = started_s
         clear_probes = 0
-        while time.monotonic() - started_s < PATH_BLOCKED_WAIT_S:
+        while not self.stop_requested:
             spin_node(self, timeout_sec=0.05)
             if self.stop_requested:
                 return False
@@ -782,7 +779,7 @@ class CorridorRoute(Node):
                 self._report('path_blocked_cleared', wait=wait,
                              held_s=round(probed_s - started_s, 1))
                 return True
-        return True
+        return False
 
     def _path_open(self):
         """Whether a fresh plan to the remaining goal exists (see ServiceRoute)."""
@@ -823,13 +820,28 @@ class CorridorRoute(Node):
         self.last_readiness_failure = None
         deadline = time.monotonic() + timeout
         protection_failure = None
+        missing_amcl_refresh_attempted = False
+        missing_amcl_refresh_required = False
         while time.monotonic() < deadline and not self.stop_requested:
             spin_node(self, timeout_sec=0.1)
             protection_failure = (
                 self._revisit_protection_ready()
                 if self.navigation_profile == 'new_base_revisit_candidate'
                 else None)
-            if self._navigation_ready() and protection_failure is None:
+            failure = self._guard_failure()
+            if failure == 'AMCL pose missing':
+                missing_amcl_refresh_required = True
+            if (missing_amcl_refresh_required
+                    and not missing_amcl_refresh_attempted
+                    and failure in (None, 'AMCL pose missing')):
+                attempted, confirmed = self._refresh_missing_amcl_at_rest(
+                    deadline)
+                missing_amcl_refresh_attempted = attempted
+                if confirmed:
+                    missing_amcl_refresh_required = False
+            if (not missing_amcl_refresh_required
+                    and self._navigation_ready()
+                    and protection_failure is None):
                 self.start_check_pending = False
                 if self.travel_pose_status is not None:
                     maximum_error_rad = self.travel_pose_status[
@@ -844,6 +856,59 @@ class CorridorRoute(Node):
         self.get_logger().error(
             'navigation readiness timeout: ' + self.last_readiness_failure)
         return False
+
+    def _refresh_missing_amcl_at_rest(self, readiness_deadline_s):
+        """Return whether a refresh was attempted and confirmed while at rest."""
+        def stationary_odometry_is_fresh():
+            motion = getattr(self, 'latest_motion', None)
+            now_s = time.monotonic()
+            return (motion is not None and now_s - motion[0] <= 0.5
+                    and all(math.isfinite(value) for value in motion)
+                    and abs(motion[1]) < 0.01 and abs(motion[2]) < 0.01)
+
+        if self.stop_requested:
+            return True, False
+        if not stationary_odometry_is_fresh():
+            return False, False
+        operator_link_ready = getattr(self, '_operator_link_ready', None)
+        if operator_link_ready is not None and not operator_link_ready():
+            return True, False
+        client = None
+        future = None
+        try:
+            client = self.create_client(Empty, '/request_nomotion_update')
+            remaining_s = readiness_deadline_s - time.monotonic()
+            if remaining_s <= 0.0 or not client.wait_for_service(
+                    timeout_sec=min(0.2, remaining_s)):
+                return True, False
+            requested_s = time.monotonic()
+            future = client.call_async(Empty.Request())
+            while (not future.done() and not self.stop_requested
+                   and time.monotonic() < readiness_deadline_s):
+                if not stationary_odometry_is_fresh():
+                    return False, False
+                spin_node(self, timeout_sec=0.05)
+            if (not future.done() or future.exception() is not None
+                    or future.result() is None):
+                return True, False
+            while (not self.stop_requested
+                   and time.monotonic() < readiness_deadline_s):
+                if not stationary_odometry_is_fresh():
+                    return False, False
+                if (getattr(self, 'amcl_seen', None) or 0.0) > requested_s:
+                    self.get_logger().info(
+                        'AMCL pose recovered by stationary no-motion update')
+                    return True, True
+                spin_node(self, timeout_sec=0.05)
+        except (AttributeError, RuntimeError):
+            return True, False
+        finally:
+            if (client is not None and future is not None
+                    and not future.done()):
+                client.remove_pending_request(future)
+            if client is not None:
+                self.destroy_client(client)
+        return True, False
 
     def readiness_failure_reason(self):
         """Retain the failed readiness attempt's cause for the caller's result log."""

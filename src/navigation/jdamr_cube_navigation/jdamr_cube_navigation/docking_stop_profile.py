@@ -6,7 +6,7 @@ import math
 
 
 # This is a user-approved target clearance, not an externally measured result.
-USER_APPROVED_CLEARANCE_M = 0.05
+USER_APPROVED_CLEARANCE_M = 0.40
 MINIMUM_PADDED_STOP_MARGIN_M = 0.02
 
 
@@ -104,7 +104,7 @@ def _set_front(points, front_m):
 
 def apply_docking_stop_profile(nav2_document, geometry):
     """
-    Return a copy for the 5 cm precision session.
+    Return a copy with the approved forward stop clearance.
 
     Only the forward (general and zero-turn)/stopped StopZone front X moves to
     the approved clearance,

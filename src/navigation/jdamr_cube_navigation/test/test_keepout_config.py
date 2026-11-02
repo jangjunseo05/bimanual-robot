@@ -314,9 +314,9 @@ def test_onboard_core_loads_only_corridor_required_nav2_processes():
             'nav2_smoother::SmootherServer',
             'nav2_waypoint_follower::WaypointFollower'):
         assert omitted not in source
-    # Wait is an explicit candidate-only dependency, not a baseline server.
+    # Corridor and precision profiles both require Wait for stopped recovery.
     assert "'navigation_profile', default_value='corridor'" in source
-    assert "if profile in {'obstacle_candidate', 'obstacle_base_candidate'," \
+    assert "if profile in {'corridor', 'obstacle_candidate', 'obstacle_base_candidate'," \
         in source
     assert "'new_base_candidate', 'new_base_revisit_candidate'}:" in source
     assert "'obstacle_base_candidate'" in source
@@ -381,24 +381,30 @@ def test_all_composed_nodes_explicitly_receive_the_selected_clock():
 
 
 def test_corridor_route_retries_but_never_turns_around():
-    """Retry a transient failure; never hide a fault behind spin or backup."""
+    """Stop, wait, and retry the same path without moving recovery actions."""
     # Rotation and reversing stay out because they make the recorded state
-    # ambiguous, and behavior_server is not started onboard.
+    # ambiguous; behavior_server supplies only the stationary Wait recovery.
     source = ROUTE_SOURCE.read_text(encoding='utf-8')
     root = ET.parse(CORRIDOR_BT).getroot()
     tags = {element.tag for element in root.iter()}
 
     assert 'navigate_to_pose_corridor_fail_fast.xml' in source
     assert 'RecoveryNode' in tags
-    assert 'ClearEntireCostmap' in tags
+    assert 'ClearEntireCostmap' not in tags
     assert 'Spin' not in tags
     assert 'BackUp' not in tags
-    assert 'Wait' not in tags
+    assert 'Wait' in tags
     assert 'ComputePathToPose' in tags
     assert 'FollowPath' in tags
-    # Recovery must stay bounded so a stuck robot still ends the run.
+    # Recovery stays bounded while allowing a one-minute transient blockage.
     for node in root.iter('RecoveryNode'):
-        assert int(node.attrib['number_of_retries']) <= 6
+        assert node.attrib['number_of_retries'] == '60'
+    assert [node.tag for node in root.find(
+        ".//RecoveryNode[@name='ComputeCorridorPathRetry']")[1]] == [
+            'WouldAPlannerRecoveryHelp', 'Wait']
+    assert [node.tag for node in root.find(
+        ".//RecoveryNode[@name='FollowCorridorPathRetry']")[1]] == [
+            'WouldAControllerRecoveryHelp', 'Wait']
     # The BT attribute overrides bt_navigator's default_server_timeout, so the
     # two executable values move together.
     assert root.findall(

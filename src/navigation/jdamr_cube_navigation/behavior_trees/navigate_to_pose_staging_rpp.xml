@@ -1,46 +1,26 @@
 <!--
-  Dock staging position leg (2026-09-30: replanning every second gave 113 new
-  paths in 127 s while AMCL jumped). Replan only when the path became invalid,
-  is 10 s old, or the goal changed. The goal checker judges position only; the
-  executor turns once in odom and aligns afterwards.
-  Lattice plans first; when it finds no path NavFn plans the same goal
-  (2026-10-02 10:39: Lattice failed four times from beside table_02 while NavFn
-  had a path, and the cycle stopped short of the dock).
--->
-<!--
-  RPP staging (default transit navfn-rpp since 2026-10-06). NavFn only, as navfn-mppi: on
-  2026-10-06 16:21 Lattice planned the leg from table_02 west past the dock to x -0.60,
-  turned there and drove forward east to the staging pose before the reverse docking
-  (51 s against 28 s in the morning). The executor turns to the dock heading at the
-  staging pose afterwards, so the planner need not arrive facing it.
+  NavFn plans the staging leg once. A transient planner failure waits one
+  second before retrying, but a successful path is never recomputed during
+  this goal. RPP stops on a controller failure, waits, and restarts that same
+  path. The position-only goal checker and parent safety guards are unchanged.
 -->
 <root BTCPP_format="4" main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <RecoveryNode number_of_retries="1" name="Staging">
-      <PipelineSequence>
-        <RateController hz="1.0">
-          <Fallback>
-            <ReactiveSequence>
-              <Inverter>
-                <PathExpiringTimer seconds="10" path="{path}"/>
-              </Inverter>
-              <Inverter>
-                <GlobalUpdatedGoal/>
-              </Inverter>
-              <IsPathValid path="{path}"/>
-            </ReactiveSequence>
-            <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased" error_code_id="{compute_path_error_code}" server_timeout="3000"/>
-          </Fallback>
-        </RateController>
-        <FollowPath path="{path}" controller_id="FollowPath" goal_checker_id="staging_position_checker" error_code_id="{follow_path_error_code}" server_timeout="3000"/>
-      </PipelineSequence>
-      <Sequence>
-        <Fallback>
+    <Sequence name="PlanOnceThenFollowStagingPath">
+      <RecoveryNode number_of_retries="60" name="ComputeStagingPathRetry">
+        <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased" error_code_id="{compute_path_error_code}" server_timeout="3000"/>
+        <Sequence name="WaitForStagingPlanner">
           <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+          <Wait wait_duration="1.0"/>
+        </Sequence>
+      </RecoveryNode>
+      <RecoveryNode number_of_retries="60" name="FollowStagingPathRetry">
+        <FollowPath path="{path}" controller_id="FollowPath" goal_checker_id="staging_position_checker" error_code_id="{follow_path_error_code}" server_timeout="3000"/>
+        <Sequence name="WaitForStagingController">
           <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
-        </Fallback>
-        <Wait wait_duration="1.0"/>
-      </Sequence>
-    </RecoveryNode>
+          <Wait wait_duration="1.0"/>
+        </Sequence>
+      </RecoveryNode>
+    </Sequence>
   </BehaviorTree>
 </root>

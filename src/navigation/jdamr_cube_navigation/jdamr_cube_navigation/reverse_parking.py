@@ -282,7 +282,7 @@ def trail_retrace_points(current, trail, distance_m, max_gap_m, max_turn_rad,
 
 
 def remembered_blind_points(keyframes, current_pose, laser_pose, blind_radius_m,
-                            source_point_filter=None):
+                            source_point_filter=None, source_records=None):
     """
     Return remembered returns that now lie inside the LiDAR blind range, base frame.
 
@@ -311,6 +311,8 @@ def remembered_blind_points(keyframes, current_pose, laser_pose, blind_radius_m,
             by = relative[1] + sin_yaw * x_m + cos_yaw * y_m
             if math.hypot(bx - lx, by - ly) < blind_radius_m:
                 found.append((bx, by))
+                if source_records is not None:
+                    source_records.append((tuple(pose), scan, (x_m, y_m), tuple(current_pose)))
     return found
 
 

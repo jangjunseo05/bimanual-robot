@@ -1,4 +1,4 @@
-"""Tests for the bounded five-centimeter docking StopZone profile."""
+"""Tests for the bounded forward docking StopZone profile."""
 
 from copy import deepcopy
 import json
@@ -49,14 +49,10 @@ def test_only_stopzone_front_and_slowdown_switch_change_and_input_is_untouched()
     output = apply_docking_stop_profile(nav2, geometry)
     assert nav2 == original
     assert changed_paths(nav2, output) == {
-        ('collision_monitor', 'ros__parameters', 'StopZone',
-         'translation_forward', 'points'),
-        ('collision_monitor', 'ros__parameters', 'StopZone',
-         'translation_forward_straight', 'points'),
-        ('collision_monitor', 'ros__parameters', 'StopZone',
-         'stopped', 'points'),
         ('collision_monitor', 'ros__parameters', 'SlowdownZone', 'enabled'),
     }
+    assert USER_APPROVED_CLEARANCE_M == pytest.approx(0.40)
+
 
 
 @pytest.mark.parametrize('name', [
@@ -121,7 +117,7 @@ def test_target_remains_ahead_of_padded_footprint_by_required_margin():
                 [-0.295, 0.29]]), 'footprint fronts differ'),
         (lambda nav, _geometry: [
             nav[name][name]['ros__parameters'].update(footprint=[
-                [0.10, 0.29], [0.10, -0.29], [-0.295, -0.29],
+                [0.45, 0.29], [0.45, -0.29], [-0.295, -0.29],
                 [-0.295, 0.29]])
             for name in ('local_costmap', 'global_costmap')],
          'lacks padded footprint margin'),
@@ -197,10 +193,22 @@ def test_t37_precision_final_approach_outruns_the_progress_checker():
 
 
 def test_t37_precision_profile_keeps_stop_and_approach_protection():
-    """Disabling the slowdown ring leaves the 5 cm StopZone and approach active."""
+    """Disabling the slowdown ring leaves the approved StopZone and approach active."""
     nav2, geometry = documents()
     monitor = apply_docking_stop_profile(nav2, geometry)['collision_monitor']['ros__parameters']
     assert monitor['StopZone']['enabled'] is True
     assert monitor['FootprintApproach']['enabled'] is True
     assert monitor['SlowdownZone']['enabled'] is False
     assert 'SlowdownZone' in monitor['polygons']
+
+
+def test_standard_session_rejects_legacy_front_margin():
+    nav2, geometry = documents()
+    for name in ('translation_forward', 'translation_forward_straight', 'stopped'):
+        polygon = points(nav2['collision_monitor']['ros__parameters']['StopZone'][name]['points'])
+        for point in polygon:
+            if point[0] == 0.465:
+                point[0] = 0.12
+        nav2['collision_monitor']['ros__parameters']['StopZone'][name]['points'] = json.dumps(polygon)
+    with pytest.raises(RuntimeError, match='margin'):
+        validate_new_base_params(nav2, geometry)

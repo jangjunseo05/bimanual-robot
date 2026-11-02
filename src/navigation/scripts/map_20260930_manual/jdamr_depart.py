@@ -76,13 +76,14 @@ PI_GEOMETRY = (f'{PI_WS}/install/jdamr_cube_description/share/jdamr_cube_descrip
 PI_MOUNT = f'{PI_HOME}/jdamr_deploy/camera_mount_current.yaml'
 ROS_ENV = ('export ROS_DOMAIN_ID=12 ROS_LOCALHOST_ONLY=0 '
            'ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST FASTDDS_BUILTIN_TRANSPORTS=UDPv4')
-# Nav2 session and every short-lived Pi participant use loopback UDP without shared
-# memory: under LOCALHOST rmw_fastrtps always adds shared memory, and a joining
-# participant froze the Nav2 container by invalidating its port (2026-09-30).
-# Loopback UDP did not stop the container deadlock (churn test 2026-09-30 10:55);
-# keep the project-standard LOCALHOST transport and test per-process Nav2 nodes.
-PI_SOURCE = f'set +u; source /opt/ros/jazzy/setup.bash; source {PI_WS}/install/setup.bash; {ROS_ENV}'
-SESSION_DISCOVERY = 'LOCALHOST'
+# Fast DDS LOCALHOST adds SHM even when UDPv4 is requested. Use the existing
+# loopback-only XML with SUBNET discovery so Pi peers keep UDP on 127.0.0.1.
+PI_DDS_PROFILE = f'{PI_SHARE}/config/fastdds_udp_loopback.xml'
+PI_SOURCE = (f'set +u; source /opt/ros/jazzy/setup.bash; '
+             f'source {PI_WS}/install/setup.bash; {ROS_ENV}; '
+             'export ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET '
+             f'FASTRTPS_DEFAULT_PROFILES_FILE={shlex.quote(PI_DDS_PROFILE)}')
+SESSION_DISCOVERY = 'SUBNET'
 # The shared Astra is owned by Windows in the current serving scenario.
 CAMERA_TRANSPORT = os.environ.get('JDAMR_CAMERA_TRANSPORT', 'windows_tcp')
 if CAMERA_TRANSPORT not in ('windows_tcp', 'usb'):

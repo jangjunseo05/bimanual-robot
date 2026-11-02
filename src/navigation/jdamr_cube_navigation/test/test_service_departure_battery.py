@@ -8,6 +8,7 @@ from unittest.mock import Mock
 from jdamr_cube_navigation import corridor_route
 from jdamr_cube_navigation.restaurant_service import load_service_contract, ServiceRoute
 import pytest
+from rclpy.task import Future
 import yaml
 
 
@@ -55,6 +56,161 @@ def test_readiness_preserves_protection_failure(monkeypatch):
     node = readiness_node(monkeypatch, protection=reason)
     assert not node.wait_until_ready(timeout=.2)
     assert node.readiness_failure_reason() == reason
+
+
+@pytest.mark.parametrize('new_pose,ready', [(True, True), (False, False)])
+def test_readiness_requires_new_amcl_after_stationary_nomotion_update(
+        monkeypatch, new_pose, ready):
+    clock = [0.0]
+    node = readiness_node(monkeypatch)
+    node.navigation_profile = 'corridor'
+    node.start_check_pending = True
+    node.latest_motion = (clock[0], 0.0, 0.0)
+    node.amcl_seen = None
+    node._guard_failure.side_effect = (
+        lambda *_args, **_kwargs:
+        'AMCL pose missing' if node.amcl_seen is None else None)
+    future = Future()
+    future.set_result(object())
+    client = Mock()
+    client.wait_for_service.return_value = True
+    client.call_async.return_value = future
+    node.create_client = Mock(return_value=client)
+    node.destroy_client = Mock()
+
+    def spin(*_args, **_kwargs):
+        clock[0] += .05
+        if new_pose and client.call_async.called:
+            node.amcl_seen = clock[0]
+
+    monkeypatch.setattr(corridor_route.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(corridor_route, 'spin_node', spin)
+
+    assert node.wait_until_ready(timeout=.5) is ready
+    assert node.start_check_pending is (not ready)
+    assert node.create_client.call_args.args[1] == '/request_nomotion_update'
+    node.destroy_client.assert_called_once_with(client)
+
+
+def test_readiness_does_not_request_nomotion_update_while_moving(monkeypatch):
+    node = readiness_node(monkeypatch, guard='AMCL pose missing')
+    node.navigation_profile = 'corridor'
+    node.latest_motion = (0.0, 0.02, 0.0)
+    node.create_client = Mock()
+
+    assert not node.wait_until_ready(timeout=.2)
+    node.create_client.assert_not_called()
+    assert node.readiness_failure_reason() == 'AMCL pose missing'
+
+
+def test_readiness_defers_nomotion_update_until_odometry_stops(monkeypatch):
+    clock = [0.0]
+    node = readiness_node(monkeypatch, guard='AMCL pose missing')
+    node.navigation_profile = 'corridor'
+    node.latest_motion = (clock[0], 0.02, 0.0)
+    node.amcl_seen = None
+    future = Future()
+    future.set_result(object())
+    client = Mock()
+    client.wait_for_service.return_value = True
+    client.call_async.return_value = future
+    node.create_client = Mock(return_value=client)
+    node.destroy_client = Mock()
+
+    def spin(*_args, **_kwargs):
+        clock[0] += .05
+        if clock[0] >= .15:
+            node.latest_motion = (clock[0], 0.0, 0.0)
+        if client.call_async.called:
+            node.amcl_seen = clock[0]
+            node._guard_failure.return_value = None
+
+    monkeypatch.setattr(corridor_route.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(corridor_route, 'spin_node', spin)
+
+    assert node.wait_until_ready(timeout=.5)
+    client.call_async.assert_called_once()
+
+
+@pytest.mark.parametrize('latest_motion', [
+    (0.1, 0.02, 0.0),
+    (-1.0, 0.0, 0.0),
+])
+def test_readiness_rejects_nomotion_refresh_if_odometry_changes_after_request(
+        monkeypatch, latest_motion):
+    clock = [0.0]
+    node = readiness_node(monkeypatch)
+    node.navigation_profile = 'corridor'
+    node.latest_motion = (clock[0], 0.0, 0.0)
+    node.amcl_seen = None
+    node._guard_failure.side_effect = (
+        lambda *_args, **_kwargs:
+        'AMCL pose missing' if node.amcl_seen is None else None)
+    future = Future()
+    future.set_result(object())
+    client = Mock()
+    client.wait_for_service.return_value = True
+    client.call_async.return_value = future
+    node.create_client = Mock(return_value=client)
+    node.destroy_client = Mock()
+
+    def spin(*_args, **_kwargs):
+        clock[0] += .1
+        if client.call_async.called:
+            node.latest_motion = latest_motion
+            node.amcl_seen = clock[0]
+
+    monkeypatch.setattr(corridor_route.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(corridor_route, 'spin_node', spin)
+
+    assert not node.wait_until_ready(timeout=.7)
+    client.call_async.assert_called_once()
+    assert node.readiness_failure_reason() == 'navigation readiness timeout'
+
+
+def test_readiness_retries_after_motion_and_requires_another_new_amcl_pose(
+        monkeypatch):
+    clock = [0.0]
+    node = readiness_node(monkeypatch)
+    node.navigation_profile = 'corridor'
+    node.start_check_pending = True
+    node.latest_motion = (clock[0], 0.0, 0.0)
+    node.amcl_seen = None
+    node._guard_failure.side_effect = (
+        lambda *_args, **_kwargs:
+        'AMCL pose missing' if node.amcl_seen is None else None)
+    futures = []
+    client = Mock()
+    client.wait_for_service.return_value = True
+
+    def request(_request):
+        future = Future()
+        future.set_result(object())
+        futures.append(future)
+        return future
+
+    client.call_async.side_effect = request
+    node.create_client = Mock(return_value=client)
+    node.destroy_client = Mock()
+    movement_injected = [False]
+
+    def spin(*_args, **_kwargs):
+        clock[0] += .05
+        if len(futures) == 1 and not movement_injected[0]:
+            node.latest_motion = (clock[0], 0.02, 0.0)
+            node.amcl_seen = clock[0]
+            movement_injected[0] = True
+        elif len(futures) < 2:
+            node.latest_motion = (clock[0], 0.0, 0.0)
+        elif len(futures) == 2:
+            node.latest_motion = (clock[0], 0.0, 0.0)
+            node.amcl_seen = clock[0]
+
+    monkeypatch.setattr(corridor_route.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(corridor_route, 'spin_node', spin)
+
+    assert node.wait_until_ready(timeout=.7)
+    assert client.call_async.call_count == 2
 
 
 def test_readiness_stop_takes_priority_and_success_clears_old_failure(monkeypatch):

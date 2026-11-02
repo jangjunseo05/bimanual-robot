@@ -274,6 +274,7 @@ def _watch(node, command, state, linear_decel_mps2, angular_decel_radps2):
     if scan_key != state['scan_key']:
         try:
             state['memory'] = tuple(node._remembered_blind_points(state['laser'], scan))
+            state['memory_sources'] = tuple(getattr(node, '_blind_point_sources', ()))
         except (AttributeError, RuntimeError, ValueError):
             return f'{collision_context} blind-range memory unavailable'
         state['scan_key'] = scan_key
@@ -288,6 +289,7 @@ def _watch(node, command, state, linear_decel_mps2, angular_decel_radps2):
             abs(angular_radps) / angular_decel_radps2)
         live_points = scan_points(scan, state['laser'])
         remembered_points = state['memory']
+        remembered_sources = state.get('memory_sources', ())
         target = state.get('target')
         if _may_ignore_target(command, target, stamp_s):
             live_points = [point for point in live_points
@@ -296,14 +298,18 @@ def _watch(node, command, state, linear_decel_mps2, angular_decel_radps2):
             filtered_memory_key = (scan_key, id(source_filter))
             if state['filtered_memory_key'] != filtered_memory_key:
                 filtered_memory = remembered_points
+                filtered_sources = remembered_sources
                 if callable(source_filter):
                     filtered_memory = tuple(node._remembered_blind_points(
                         state['laser'], scan,
                         source_point_filter=lambda pose, source_scan, point: not
                         source_filter(pose, source_scan, point)))
+                    filtered_sources = tuple(getattr(node, '_blind_point_sources', ()))
                 state['filtered_memory'] = filtered_memory
+                state['filtered_sources'] = filtered_sources
                 state['filtered_memory_key'] = filtered_memory_key
             remembered_points = state['filtered_memory']
+            remembered_sources = state['filtered_sources']
         points = [*live_points, *remembered_points]
         poses = _prediction_poses(linear_mps, angular_radps, horizon_s)
         witness = {}
@@ -312,9 +318,25 @@ def _watch(node, command, state, linear_decel_mps2, angular_decel_radps2):
             if not state['collision_active']:
                 live_hit = witness['point_index'] < len(live_points)
                 source = 'live_scan' if live_hit else 'remembered_blind_point'
+                origin = None
+                index = witness['point_index'] - len(live_points)
+                if not live_hit and 0 <= index < len(remembered_sources):
+                    pose, source_scan, point, current_pose = remembered_sources[index]
+                    origin = {
+                        'pose_odom': list(pose), 'point_base_xy_m': list(point),
+                        'current_pose_odom': list(current_pose),
+                        'laser_pose_base': list(state['laser']),
+                        'scan_stamp_s': _stamp_s(source_scan),
+                        'angle_min': source_scan.angle_min,
+                        'angle_increment': source_scan.angle_increment,
+                        'range_min': source_scan.range_min, 'range_max': source_scan.range_max,
+                        'ranges': [float(r) if math.isfinite(r) else None
+                                   for r in source_scan.ranges],
+                    }
                 node.emit(
                     'rear_collision_witness', source=source,
                     point_base_xy_m=witness['point_base_xy_m'], scan_stamp_s=stamp_s,
+                    remembered_source=origin,
                     live_point_count=len(live_points),
                     remembered_point_count=len(remembered_points),
                     target_face_filter_active=target is not None,
@@ -356,6 +378,7 @@ def _motion_collision_watch(node, snapshot, *, rotation=False):
     state = {
         'laser': tuple(laser), 'outline': tuple(tuple(point) for point in outline),
         'memory': tuple(memory), 'frame_id': scan.header.frame_id,
+        'memory_sources': tuple(getattr(node, '_blind_point_sources', ())),
         'scan_key': (id(scan), _stamp_s(scan)),
         'target': None,
         'filtered_memory': (), 'filtered_memory_key': None,

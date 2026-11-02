@@ -47,9 +47,22 @@ def session_env(tmp_path):
 printf 'systemctl %s\n' "$*" >> "$MOCK_LOG"
 if [ "$1" = status ]; then exit "${MOCK_STATUS_RC:-0}"; fi
 if [ "$1" = stop ]; then exit 0; fi
+if [ "$1" = daemon-reload ]; then touch "$MOCK_LOG.reloaded"; exit 0; fi
 if [ "$1" = start ]; then
   touch "$MOCK_LOG.started"
   exit "${MOCK_START_RC:-0}"
+fi
+if [ "$1" = show ] && [ "${@: -1}" = --value ]; then
+  if [[ "$*" == *--property=ActiveState* ]]; then
+    echo "${MOCK_SHOW_ACTIVE_STATE:-inactive}"
+    exit 0
+  fi
+  if [ -e "$MOCK_LOG.reloaded" ] && [ "${MOCK_RELEASE_FAIL:-0}" != 1 ]; then
+    echo not-found
+  else
+    echo loaded
+  fi
+  exit 0
 fi
 if [ "$1" = show ]; then
   active_state="${MOCK_SHOW_ACTIVE_STATE:-active}"
@@ -101,6 +114,14 @@ exit "${MOCK_REGISTRY_RC:-0}"
 printf 'systemd-run %s\n' "$*" >> "$MOCK_LOG"
 exit "${MOCK_SYSTEMD_RUN_RC:-0}"
 """)
+    _executable(bin_dir / 'cp', r"""
+printf 'cp %s\n' "$*" >> "$MOCK_LOG"
+exit 0
+""")
+    _executable(bin_dir / 'rm', r"""
+printf 'rm %s\n' "$*" >> "$MOCK_LOG"
+exit 0
+""")
     _executable(bin_dir / 'sudo', r"""
 printf 'sudo %s\n' "$*" >> "$MOCK_LOG"
 [ "$1" = -n ] && shift
@@ -113,6 +134,7 @@ exec "$@"
         'PATH': f'{bin_dir}:{env["PATH"]}',
         'JDAMR_ROS_SETUP': str(ros_setup),
         'MOCK_LOG': str(log),
+        'TMPDIR': str(tmp_path),
     })
     return {
         'env': env, 'home': home, 'workspace': workspace,
@@ -297,7 +319,7 @@ def test_repeated_start_reuses_matching_inactive_transient_unit(session_env):
     assert 'systemctl stop ' not in commands
 
 
-def test_inactive_transient_unit_with_changed_identity_is_not_reused(session_env):
+def test_inactive_transient_unit_with_changed_identity_is_recreated(session_env):
     identity = _started_identity(session_env)
     session_env['params'].write_text(
         'controller_server: {changed: true}\n', encoding='utf-8')
@@ -308,14 +330,38 @@ def test_inactive_transient_unit_with_changed_identity_is_not_reused(session_env
         MOCK_SHOW_SUB_STATE='dead',
         MOCK_SHOW_FRAGMENT_PATH=(
             '/run/systemd/transient/jdamr-restaurant-navigation.service'),
-        MOCK_UNIT_ENV=identity,
+        MOCK_UNIT_ENV=identity + " JDAMR_RESTAURANT_INTERNAL=1",
     )
-    assert result.returncode == 4
-    assert '요청과 다르다' in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert '새 설정으로 생성한다' in result.stdout
     commands = session_env['log'].read_text(encoding='utf-8')
     assert 'systemctl start ' not in commands
+    assert 'systemd-run ' in commands
+    assert 'systemctl stop ' in commands
+    assert commands.index('cp -- /run/systemd/transient/') < commands.index('systemctl stop ')
+
+
+
+@pytest.mark.parametrize('owned,release_fails', [(False, False), (True, True)])
+def test_changed_inactive_session_requires_ownership_and_release(
+        session_env, owned, release_fails):
+    identity = _started_identity(session_env)
+    session_env['params'].write_text('changed: true\n', encoding='utf-8')
+    result = _start(
+        session_env, MOCK_SHOW_LOAD_STATE='loaded',
+        MOCK_SHOW_ACTIVE_STATE='inactive', MOCK_SHOW_SUB_STATE='dead',
+        MOCK_SHOW_FRAGMENT_PATH=(
+            '/run/systemd/transient/jdamr-restaurant-navigation.service'),
+        MOCK_UNIT_ENV=identity + (
+            ' JDAMR_RESTAURANT_INTERNAL=1' if owned else ''),
+        MOCK_RELEASE_FAIL='1' if release_fails else '0',
+    )
+    assert result.returncode == 4
+    commands = session_env['log'].read_text(encoding='utf-8')
     assert 'systemd-run ' not in commands
-    assert 'systemctl stop ' not in commands
+    assert 'systemctl start ' not in commands
+    if not owned:
+        assert 'systemctl stop ' not in commands
 
 
 def test_matching_inactive_persistent_unit_is_not_reused(session_env):
@@ -649,3 +695,20 @@ def test_status_and_stop_target_only_navigation_unit(session_env):
     assert 'systemctl status --no-pager jdamr-restaurant-navigation.service' in commands
     assert 'systemctl stop jdamr-restaurant-navigation.service' in commands
     assert 'systemctl stop jdamr-base.service' not in commands
+
+
+def test_transport_profile_is_forwarded_and_changes_identity(session_env):
+    profile = session_env['home'] / 'dds.xml'
+    profile.write_text('<profiles/>', encoding='utf-8')
+    result = _start(session_env, FASTRTPS_DEFAULT_PROFILES_FILE=str(profile))
+    assert result.returncode == 0, result.stderr
+    commands = session_env['log'].read_text()
+    assert '--setenv=FASTRTPS_DEFAULT_PROFILES_FILE=' + str(profile) in commands
+    identity = re.search(r'JDAMR_RESTAURANT_SESSION_ID=([0-9a-f]+)', commands)[1]
+    session_env['log'].write_text('')
+    profile.write_text('<profiles><!-- changed --></profiles>', encoding='utf-8')
+    result = _start(session_env, FASTRTPS_DEFAULT_PROFILES_FILE=str(profile))
+    assert result.returncode == 0, result.stderr
+    changed = re.search(
+        r'JDAMR_RESTAURANT_SESSION_ID=([0-9a-f]+)', session_env['log'].read_text())[1]
+    assert changed != identity

@@ -98,7 +98,7 @@ OPERATOR_LINK_TIMEOUT_S = 30.0
 # the hold, as Nav2's default tree backs up before it retries.
 PATH_BLOCKED_BACKOFF_M = 0.10
 # The band in front of the chassis front edge that counts as "blocked ahead".
-PATH_BLOCKED_AHEAD_BAND_M = 0.30
+PATH_BLOCKED_AHEAD_BAND_M = 0.40
 # An in-place turn sweeps the rear about the axle near the front. Something beside
 # the rear inside the 0.43 m rotation StopZone (+2 cm) blocks every turn, and an
 # arc swings the rear toward it (2026-10-02 11:09: a left arc put a desk leg inside
@@ -901,12 +901,13 @@ class ServiceRoute(CorridorRoute):
         keyframes = [(pose, frame) for stamp_s, pose, frame
                      in getattr(self, 'scan_memory', None) or ()
                      if now_s - stamp_s <= SCAN_MEMORY_MAX_AGE_S]
+        self._blind_point_sources = []
         if not keyframes:
             return []
         current_pose = self._odom_pose()
         return remembered_blind_points(
             keyframes, current_pose, laser, scan.range_min,
-            source_point_filter=source_point_filter)
+            source_point_filter=source_point_filter, source_records=self._blind_point_sources)
 
     def _remember_scan(self, scan):
         """Keep a scan whenever the base moved SCAN_MEMORY_STEP_M or turned STEP_RAD."""
@@ -1654,6 +1655,7 @@ class ServiceRoute(CorridorRoute):
             'table approach observer silent',
             'table approach depth stale or future-dated',
             'table approach observer latency',
+            'table approach tape reference pending',
         }
         recoverable_rear_failures = {
             'rear box scan unavailable', 'rear box scan stale or future-dated',
@@ -1687,8 +1689,9 @@ class ServiceRoute(CorridorRoute):
             resume_speed = state.get('resume_speed_mps', speed_mps)
             paused_s = time.monotonic()
             rear_recovery = reason in recoverable_rear_failures
+            bounded_recovery = rear_recovery or reason == 'table approach tape reference pending'
             recovery_deadline_s = (min(deadline_s, getattr(self, 'run_deadline_s', deadline_s))
-                                   if rear_recovery else math.inf)
+                                   if bounded_recovery else math.inf)
             event_prefix = 'rear_box' if rear_recovery else 'table_approach'
             self.emit(f'{event_prefix}_waiting_for_input', reason=reason,
                       travelled_m=state['travelled'], target_preserved=True)
@@ -1733,7 +1736,7 @@ class ServiceRoute(CorridorRoute):
             if self.stop_requested or state['tf_failure'] or state['target_failure']:
                 command.linear.x = command.angular.z = 0.0
                 break
-            if not rear_recovery:
+            if not bounded_recovery:
                 deadline_s += time.monotonic() - paused_s
             timing['checked_s'] = None
         # Recovery can discover a different terminal failure without entering
@@ -2043,7 +2046,24 @@ class ServiceRoute(CorridorRoute):
                         and not departure.get('rear_release_complete', False)):
                     found = self._scan_in_base()
                     if found is None:
-                        self.emit(f'{motion}_release_failed', reason='no fresh scan')
+                        # Path preparation can outlast the scan freshness window.
+                        # Stay stopped while callbacks refresh the snapshot; never
+                        # extend the age accepted by _scan_in_base.
+                        self.emit(f'{motion}_release_waiting_scan')
+                        deadline = min(self.run_deadline_s,
+                                       time.monotonic() + ESCAPE_SCAN_MAX_AGE_S)
+                        while (found is None and not self.stop_requested
+                               and time.monotonic() < deadline):
+                            spin_node(self, timeout_sec=0.02)
+                            found = self._scan_in_base()
+                    if self.stop_requested:
+                        return False
+                    if found is None:
+                        received = (getattr(self, 'samples', None) or {}).get('scan')
+                        self.emit(f'{motion}_release_failed', reason='no fresh scan',
+                                  scan_callback_age_s=(time.monotonic() - received
+                                                       if received is not None else None),
+                                  scan_present=getattr(self, 'last_scan', None) is not None)
                         return False
                     if self._footprint_intrusion(found=found) in ('front', 'both'):
                         self.emit(f'{motion}_release_failed',
@@ -3259,6 +3279,19 @@ class ServiceRoute(CorridorRoute):
                               terminal_status_code=int(wrapped.status),
                               nav2_error_code=int(wrapped.result.error_code))
             self.navigation_result = None
+            # A progress abort at an intermediate XY endpoint may only mean
+            # the heading checker could not finish. The caller must reobserve
+            # and align the face; this never confirms final docking.
+            if (handoff_target is not None and not self.stop_requested
+                    and wrapped.status == GoalStatus.STATUS_ABORTED
+                    and wrapped.result.error_code == 105
+                    and self._navigation_ready(require_fresh_amcl=False)
+                    and self._operator_link_ready()
+                    and math.dist(self._odom_pose()[:2], handoff_target) <= position_handoff_m):
+                self.emit('reverse_position_handoff', motion=motion,
+                          tolerance_m=position_handoff_m, target_odom=list(handoff_target),
+                          nav2_error_code=105, final_parking=False)
+                return True
             if (self.stop_requested or wrapped.status != GoalStatus.STATUS_SUCCEEDED
                     or wrapped.result.error_code):
                 return False

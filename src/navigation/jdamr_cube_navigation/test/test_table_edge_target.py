@@ -313,3 +313,22 @@ def test_current_mount_disables_superseded_astra_s_task_calibration():
     without_calibration = deepcopy(mounted)
     without_calibration['camera_mount'].pop('table_edge_calibration')
     assert target(mounted=mounted) != target(mounted=without_calibration)
+
+
+def test_november_corner_recheck_uses_right_left_order_and_normal_distance():
+    from jdamr_cube_navigation.table_edge_target import _calibrated_table_line
+    current = yaml.safe_load((Path(__file__).parents[1] / 'config/camera_mount_current.yaml').read_text())
+    calibration = current['camera_mount']['table_edge_calibration']
+    data = calibration['field_recheck_20261101']
+    right, left = data['internal_corner_gaps_m']
+    angle = math.asin((right-left)/data['corner_spacing_m'])
+    distance = (right+left)/2 + data['front_extent_m']*math.cos(angle)
+    raw_angle = angle-data['prior_yaw_offset_rad']
+    raw_distance = distance-data['prior_plane_offset_bias_m']
+    normal = (-math.cos(raw_angle), -math.sin(raw_angle))
+    center = tuple(-raw_distance*n for n in normal)
+    corrected_center, corrected_normal, _ = _calibrated_table_line(center,normal,current)
+    corners = [(data['front_extent_m'], -data['corner_spacing_m']/2),
+               (data['front_extent_m'], data['corner_spacing_m']/2)]
+    predicted = [sum((p[i]-corrected_center[i])*corrected_normal[i] for i in (0,1)) for p in corners]
+    assert predicted == pytest.approx([data['external_right_gap_m'], data['external_left_gap_m']],abs=1e-9)

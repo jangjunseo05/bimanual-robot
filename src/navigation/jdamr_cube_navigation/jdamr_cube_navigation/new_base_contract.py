@@ -3,6 +3,8 @@
 import json
 import math
 
+from .docking_stop_profile import USER_APPROVED_CLEARANCE_M
+
 
 # Approved selection policy for the five directional StopZone entries. These
 # are software policy limits, not newly measured chassis values.
@@ -418,29 +420,30 @@ def validate_new_base_params(params, geometry, precision_parking=False):
                                 _clip_half_plane(footprint_polygon, keep)):
             raise RuntimeError(
                 f'new-base {name} StopZone does not contain its footprint half')
-    front_reference = front if precision_parking else footprint[0]
-    # Only the leading edge keeps 0.05 m; sides and rear stop at the padded
-    # footprint (operator request 2026-10-01).
-    if stopped_stop[0] - front_reference < 0.05 - 1e-6:
-        raise RuntimeError('new-base StopZone margin is below 0.05m')
-    if not (forward_stop[0] - front_reference >= 0.05 - 1e-6
+    front_reference = front
+    # All sessions retain the approved physical-front margin; sides and rear
+    # keep the padded footprint.
+    if stopped_stop[0] - front_reference < USER_APPROVED_CLEARANCE_M - 1e-6:
+        raise RuntimeError('new-base StopZone margin is below approved clearance')
+    if not (forward_stop[0] - front_reference >= USER_APPROVED_CLEARANCE_M - 1e-6
             and forward_stop[1] <= footprint[1]
             and abs(forward_stop[2] - footprint[2]) <= 1e-6):
         raise RuntimeError('new-base forward StopZone shape is invalid')
     if precision_parking and (
-            not math.isclose(forward_stop[0], front + 0.05, abs_tol=1e-6)
-            or not math.isclose(stopped_stop[0], front + 0.05, abs_tol=1e-6)
+            not math.isclose(forward_stop[0], front + USER_APPROVED_CLEARANCE_M, abs_tol=1e-6)
+            or not math.isclose(stopped_stop[0], front + USER_APPROVED_CLEARANCE_M, abs_tol=1e-6)
             or forward_stop[0] - footprint[0] < 0.02 - 1e-6):
         raise RuntimeError('precision parking requires physical front clearance and padding')
-    # The 0.05 m leading band spans the whole front edge of the footprint, in every
+    # The approved leading band spans the whole front edge of the footprint, in every
     # polygon that can stop forward motion (review 2026-10-06: a band narrowed to
     # |y| <= 0.05 passed the front-X check).
     front_half_width = max(abs(y) for x, y in footprint_polygon if x == footprint[0])
-    band = [(footprint[0], -front_half_width), (front_reference + 0.05, -front_half_width),
-            (front_reference + 0.05, front_half_width), (footprint[0], front_half_width)]
+    band_margin_m = USER_APPROVED_CLEARANCE_M
+    band = [(footprint[0], -front_half_width), (front_reference + band_margin_m, -front_half_width),
+            (front_reference + band_margin_m, front_half_width), (footprint[0], front_half_width)]
     for name in ('stopped', 'translation_forward', 'translation_forward_straight'):
         if not polygon_contains(polygon_points(stop_zone[name]['points']), band):
-            raise RuntimeError(f'new-base {name} StopZone misses the 0.05m front band')
+            raise RuntimeError(f'new-base {name} StopZone misses the approved front band')
     if not (footprint[1] - backward_stop[1] >= -1e-6
             and backward_stop[0] >= footprint[0]
             and abs(backward_stop[2] - footprint[2]) <= 1e-6):

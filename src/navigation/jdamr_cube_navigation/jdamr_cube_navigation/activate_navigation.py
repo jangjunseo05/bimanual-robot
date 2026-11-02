@@ -50,41 +50,76 @@ def load_initial_pose(path):
     return {name: document[name] for name in INITIAL_POSE_FIELDS}
 
 
-def require_active(node, names, state_id=State.PRIMARY_STATE_ACTIVE, wait=None):
-    """Check lifecycle responses rather than process or graph presence."""
+def require_active(node, names, state_id=State.PRIMARY_STATE_ACTIVE, wait=None,
+                   transition_timeout_s=0.0):
+    """Check lifecycle responses, optionally polling a bounded transition."""
     for name in names:
         client = node.create_client(GetState, '/' + name + '/get_state')
         try:
             if not client.wait_for_service(timeout_sec=5.0):
                 raise RuntimeError(name + ' lifecycle service unavailable')
             waiter = wait or node._wait
-            deadline_s = time.monotonic() + 5.0
-            response = None
-            for attempt in range(2):
-                remaining_s = deadline_s - time.monotonic()
-                if remaining_s <= 0.0:
-                    raise RuntimeError(name + ' lifecycle response timed out')
-                timeout_s = (min(2.0, remaining_s)
-                             if attempt == 0 else remaining_s)
-                future = client.call_async(GetState.Request())
-                try:
-                    response = waiter(future, timeout_s)
-                except RuntimeError as error:
-                    incomplete = not future.done()
-                    if incomplete:
-                        client.remove_pending_request(future)
-                    if (attempt == 0 and incomplete
-                            and not node.stop_requested
-                            and time.monotonic() < deadline_s):
-                        node.get_logger().warning(
-                            f'lifecycle read timeout: node={name} attempt=1/2; '
-                            f'retrying GetState within the original 5s response budget; '
-                            f'error={error}')
-                        continue
-                    raise
-                break
-            if response is None or response.current_state.id != state_id:
-                raise RuntimeError(name + ' lifecycle state unconfirmed')
+            transition_deadline_s = (
+                time.monotonic() + transition_timeout_s
+                if transition_timeout_s > 0.0 else None)
+            while True:
+                response_budget_s = 5.0
+                if transition_deadline_s is not None:
+                    response_budget_s = min(
+                        response_budget_s,
+                        transition_deadline_s - time.monotonic())
+                    if response_budget_s <= 0.0:
+                        raise RuntimeError(
+                            name + ' lifecycle transition timed out')
+                deadline_s = time.monotonic() + response_budget_s
+                response = None
+                for attempt in range(2):
+                    remaining_s = deadline_s - time.monotonic()
+                    if remaining_s <= 0.0:
+                        raise RuntimeError(
+                            name + ' lifecycle response timed out')
+                    timeout_s = (min(2.0, remaining_s)
+                                 if attempt == 0 else remaining_s)
+                    future = client.call_async(GetState.Request())
+                    try:
+                        response = waiter(future, timeout_s)
+                    except RuntimeError as error:
+                        incomplete = not future.done()
+                        if incomplete:
+                            client.remove_pending_request(future)
+                        if (attempt == 0 and incomplete
+                                and not node.stop_requested
+                                and time.monotonic() < deadline_s):
+                            node.get_logger().warning(
+                                f'lifecycle read timeout: node={name} '
+                                f'attempt=1/2; '
+                                f'retrying GetState within the original '
+                                f'{response_budget_s:g}s response budget; '
+                                f'error={error}')
+                            continue
+                        if (incomplete and transition_deadline_s is not None
+                                and not node.stop_requested
+                                and time.monotonic() < transition_deadline_s):
+                            node.get_logger().warning(
+                                f'lifecycle read still pending: node={name}; '
+                                f'polling again within the bounded transition '
+                                f'budget; error={error}')
+                            response = None
+                            break
+                        raise
+                    break
+                if (response is not None
+                        and response.current_state.id == state_id):
+                    break
+                remaining_transition_s = (
+                    transition_deadline_s - time.monotonic()
+                    if transition_deadline_s is not None else 0.0)
+                if (transition_deadline_s is None or node.stop_requested):
+                    raise RuntimeError(name + ' lifecycle state unconfirmed')
+                if remaining_transition_s <= 0.0:
+                    raise RuntimeError(
+                        name + ' lifecycle transition timed out')
+                spin_node(node, timeout_sec=min(0.1, remaining_transition_s))
         finally:
             node.destroy_client(client)
 
@@ -105,7 +140,7 @@ def initialize_localization(
                 for limit in covariance_limits):
             raise ValueError(
                 'covariance_limits must contain three finite positive values')
-    require_active(node, LOCALIZATION_NODES)
+    require_active(node, LOCALIZATION_NODES, transition_timeout_s=15.0)
     node.verify_live_maps(require_command_path=False)
     latest_sample = [None]
 
@@ -225,7 +260,7 @@ def require_parking_controller(node):
 
 def activate_prepared(node):
     """Send lifecycle startup only; never set a pose or send a motion goal."""
-    require_active(node, LOCALIZATION_NODES)
+    require_active(node, LOCALIZATION_NODES, transition_timeout_s=15.0)
     node.verify_live_maps(require_command_path=False)
     if not node.wait_until_ready(timeout=10.0):
         raise RuntimeError(node.readiness_failure_reason())
@@ -255,7 +290,7 @@ def activate_prepared(node):
         response = node._wait(client.call_async(request), 45.0)
         if response is None or not response.success:
             raise RuntimeError('navigation lifecycle startup failed')
-        require_active(node, NAVIGATION_NODES)
+        require_active(node, NAVIGATION_NODES, transition_timeout_s=15.0)
         startup_confirmed = True
         node.verify_live_maps()
         require_parking_controller(node)

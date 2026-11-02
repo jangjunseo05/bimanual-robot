@@ -148,7 +148,8 @@ def test_initialization_uses_service_ack_and_post_ack_amcl_stamp(monkeypatch):
     monkeypatch.setattr(module, 'spin_node', spin_once)
     module.initialize_localization(node, initial_pose())
 
-    check.assert_called_once_with(node, module.LOCALIZATION_NODES)
+    check.assert_called_once_with(
+        node, module.LOCALIZATION_NODES, transition_timeout_s=15.0)
     node.verify_live_maps.assert_called_once_with(require_command_path=False)
     request = initial_client.call_async.call_args.args[0]
     assert isinstance(request, SetInitialPose.Request)
@@ -446,7 +447,12 @@ def test_startup_ack_and_active_nodes_are_required(monkeypatch, success):
     node._wait.return_value = SimpleNamespace(success=success)
     if success:
         module.activate_prepared(node)
+        assert check.call_args_list[0].args[1] == module.LOCALIZATION_NODES
+        assert check.call_args_list[0].kwargs == {
+            'transition_timeout_s': 15.0}
         assert check.call_args_list[1].args[1] == module.NAVIGATION_NODES
+        assert check.call_args_list[1].kwargs == {
+            'transition_timeout_s': 15.0}
         node.emit.assert_called_once()
         assert node.verify_live_maps.call_count == 2
         assert node.verify_live_maps.call_args_list[0].kwargs == {
@@ -587,6 +593,86 @@ def test_lifecycle_read_does_not_retry_wrong_state(monkeypatch):
     client.call_async.assert_called_once()
 
 
+def test_lifecycle_transition_polls_until_active(monkeypatch):
+    node, client = prepared_node()
+    clock = [0.0]
+    states = iter([
+        State.PRIMARY_STATE_UNCONFIGURED,
+        State.PRIMARY_STATE_INACTIVE,
+        State.PRIMARY_STATE_ACTIVE,
+    ])
+    node._wait.side_effect = lambda *_args: SimpleNamespace(
+        current_state=SimpleNamespace(id=next(states)))
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(
+        module, 'spin_node',
+        lambda *_args, **_kwargs: clock.__setitem__(0, clock[0] + .1))
+
+    module.require_active(node, ['amcl'], transition_timeout_s=1.0)
+
+    assert client.call_async.call_count == 3
+    assert clock[0] == pytest.approx(.2)
+
+
+def test_lifecycle_transition_polling_is_bounded(monkeypatch):
+    node, client = prepared_node()
+    clock = [0.0]
+    node._wait.return_value = SimpleNamespace(
+        current_state=SimpleNamespace(id=State.PRIMARY_STATE_INACTIVE))
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(
+        module, 'spin_node',
+        lambda *_args, **_kwargs: clock.__setitem__(0, clock[0] + .1))
+
+    with pytest.raises(RuntimeError, match='transition timed out'):
+        module.require_active(node, ['amcl'], transition_timeout_s=.25)
+
+    assert client.call_async.call_count == 3
+
+
+def test_lifecycle_transition_never_spins_with_negative_timeout(monkeypatch):
+    node, client = prepared_node()
+    node._wait.return_value = SimpleNamespace(
+        current_state=SimpleNamespace(id=State.PRIMARY_STATE_INACTIVE))
+    clock = iter([0.0, 0.0, 0.0, 0.0, 1.01])
+    monkeypatch.setattr(module.time, 'monotonic', lambda: next(clock))
+    spin = Mock()
+    monkeypatch.setattr(module, 'spin_node', spin)
+
+    with pytest.raises(RuntimeError, match='transition timed out'):
+        module.require_active(node, ['amcl'], transition_timeout_s=1.0)
+
+    spin.assert_not_called()
+
+
+def test_lifecycle_transition_retries_beyond_first_response_budget(
+        monkeypatch):
+    node, client = prepared_node()
+    clock = [0.0]
+    first, second, third = Future(), Future(), Future()
+    third.set_result(SimpleNamespace())
+    client.call_async.side_effect = [first, second, third]
+
+    def wait(future, timeout_s):
+        if future is third:
+            return SimpleNamespace(
+                current_state=SimpleNamespace(id=State.PRIMARY_STATE_ACTIVE))
+        clock[0] += timeout_s
+        raise RuntimeError(f'no response in {timeout_s:.1f} s')
+
+    node._wait.side_effect = wait
+    monkeypatch.setattr(module.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(
+        module, 'spin_node', lambda *_args, **kwargs:
+        clock.__setitem__(0, clock[0] + kwargs['timeout_sec']))
+
+    module.require_active(node, ['amcl'], transition_timeout_s=10.0)
+
+    assert client.call_async.call_count == 3
+    assert client.remove_pending_request.call_args_list == [
+        ((first,),), ((second,),)]
+
+
 def test_startup_timeout_does_not_retry_mutating_request(monkeypatch):
     node, client = prepared_node()
     monkeypatch.setattr(module, 'require_active', Mock())
@@ -671,6 +757,7 @@ def test_navigation_active_reads_every_server_state(monkeypatch, active):
     monkeypatch.setattr(module, 'require_active', check)
     assert REAL_NAVIGATION_ACTIVE(SimpleNamespace()) is active
     assert check.call_args.args[1] == module.NAVIGATION_NODES
+    assert check.call_args.kwargs == {}
 
 
 @pytest.mark.parametrize('already_active', [True, False])
