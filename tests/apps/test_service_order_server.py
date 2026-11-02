@@ -170,6 +170,17 @@ def test_guest_and_control_pages_are_served(server):
             assert marker in response.read().decode()
 
 
+def test_control_page_keeps_operator_controls_in_one_screen():
+    html = CONTROL_PAGE.read_text(encoding="utf-8")
+    javascript = CONTROL_JS.read_text(encoding="utf-8")
+    for control in ("pause", "drive-init", "start", "stop", "estop-reset", "align-confirm", "queue", "history",
+                    "f-submit", "b-left", "b-right", "b-pi"):
+        assert f'id="{control}"' in html
+    assert "overflow: hidden" in html.split("@media")[0]
+    assert "JSON.stringify(cmd" not in javascript
+    assert "battery_percent" not in javascript.replace("battery_percent(미션 모델 추정값)", "")
+
+
 def test_guest_and_control_pages_have_no_external_runtime_dependencies():
     for page, script in ((ORDER_PAGE, ORDER_JS), (CONTROL_PAGE, CONTROL_JS), (CONTROL_PAGE, API_JS)):
         html = Path(page).read_text(encoding="utf-8")
