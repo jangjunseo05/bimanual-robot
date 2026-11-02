@@ -174,13 +174,14 @@ def test_control_page_keeps_operator_controls_in_one_screen():
     html = CONTROL_PAGE.read_text(encoding="utf-8")
     javascript = CONTROL_JS.read_text(encoding="utf-8")
     for control in ("drive-init", "start", "stop", "estop-reset", "align-confirm", "queue", "staff",
-                    "topics", "commands", "events", "t-step", "t-fail", "b-left", "b-right", "b-pi"):
+                    "topics", "commands", "events", "t-step", "t-fail", "s-drive", "s-nav", "s-location", "s-mission", "s-manip"):
         assert f'id="{control}"' in html
-    for removed in ("pause", "history", "f-submit"):
+    for removed in ("pause", "history", "f-submit", "b-left", "b-right", "b-pi", "s-battery"):
         assert f'id="{removed}"' not in html
     assert "overflow: hidden" in html.split("@media")[0]
     assert "JSON.stringify(cmd" not in javascript
-    assert "battery_percent" not in javascript.replace("battery_percent(미션 모델 추정값)", "")
+    assert "battery_percent" not in javascript and "BATTERY_RANGE_V" not in javascript
+    assert "orderTally" not in javascript
 
 
 def test_guest_and_control_pages_have_no_external_runtime_dependencies():

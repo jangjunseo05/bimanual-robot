@@ -4,6 +4,14 @@
 
 ---
 
+## 2026-11-02 | 관제 웹 상단 칸을 주행 PC 연결·Navigation·Localization으로 교체 (실제 연결 렌더링 미확인)
+
+- 배터리 3칸을 뺐다. 팔·파이 전압이 화면까지 오는 경로가 없어 `연결 안 됨`만 나왔기 때문이다. 칸 크기·개수는 유지하고 글자와 값만 바꿨다.
+- 첫 칸은 `/api/state`의 `drive_link`로 `주행 PC 연결`과 현재 단계를 표시한다. `battery_percent`는 경로 길이와 고정 소모율로 빼는 미션 모델 값이라 실측이 아니어서 표시하지 않는다. 둘째·셋째 칸은 #99 이전의 Navigation, Localization 문구를 복원했다.
+- 팔 전압 코드(`rollout_service.py`, `service_execution_backend.py`, `test_rollout_service_battery.py`)는 쓰는 화면이 없어 커밋하지 않았다.
+- 검증: 응답을 바꿔 끼운 로컬 모의 서버와 Chrome 헤드리스로 4개 해상도×5개 상태에서 페이지 스크롤 없음, 콘솔 오류 0건. `tests/apps`, `tests/mission` 등 103개 통과, 1개 실패(Windows 전용 파이프 `select`). 상태별 문구는 렌더링으로만 확인했고 실제 주행 PC 연결 상태로는 확인하지 않았다.
+- 작업 중 운영 서버 `drive_link`가 `failed`, 오류 `table lateral alignment requires more clearance`로 관측됐다. 원인은 조사하지 않았다.
+
 ## 2026-11-02 | 관제 웹 2차 수정: 전체 지도 복귀·기술 정보 복원 (운영 서버·실제 토픽 미확인)
 
 - 사용자 요청으로 지도 잘라내기를 롤백해 전체 SLAM 지도를 같은 패널 크기로 표시했다. 대기열은 약 4줄로 줄였고, 실패 원인 카드·대리 주문·자동 진행 일시정지 버튼을 화면에서 뺐다. 서버 API는 그대로다.

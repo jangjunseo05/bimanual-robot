@@ -51,7 +51,7 @@
     .banner.estop { display: flex; gap: 10px; align-items: center; justify-content: space-between; border-color: var(--danger); background: var(--danger-soft); color: var(--danger); }
     .banner .btn { flex: none; }
 
-    /* 상태 칸: 배터리 3개 + 미션 + 조작 실행기 */
+    /* 상태 칸: 주행 PC·주행·위치 + 미션 + 조작 실행기 */
     .kpis { flex: none; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 8px; }
     .kpi { padding: 6px 10px; background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); min-width: 0; }
     .kpi span { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 11.5px; }
@@ -183,9 +183,9 @@
   <div class="banner warn" id="paused-banner" hidden>서버가 자동 진행 일시정지 상태입니다. 이 화면에는 재개 버튼이 없습니다(런북 6절).</div>
 
   <div class="kpis">
-    <div class="kpi"><span><i class="dot" id="b-left-dot"></i>왼팔 배터리</span><strong id="b-left">-</strong><small id="b-left-sub">-</small></div>
-    <div class="kpi"><span><i class="dot" id="b-right-dot"></i>오른팔 배터리</span><strong id="b-right">-</strong><small id="b-right-sub">-</small></div>
-    <div class="kpi"><span><i class="dot" id="b-pi-dot"></i>파이 배터리</span><strong id="b-pi">-</strong><small id="b-pi-sub">-</small></div>
+    <div class="kpi"><span><i class="dot" id="k-drive-dot"></i>주행 PC 연결</span><strong id="s-drive">-</strong><small id="s-drive-sub">-</small></div>
+    <div class="kpi"><span><i class="dot" id="k-nav-dot"></i>Navigation (ROS 2)</span><strong id="s-nav">-</strong><small id="s-nav-sub">-</small></div>
+    <div class="kpi"><span><i class="dot" id="k-loc-dot"></i>Localization</span><strong id="s-location">-</strong><small id="s-loc-sub">-</small></div>
     <div class="kpi"><span><i class="dot" id="k-mission-dot"></i>미션</span><strong id="s-mission">-</strong><small id="s-mission-sub">-</small></div>
     <div class="kpi"><span><i class="dot" id="k-manip-dot"></i>조작 실행기</span><strong id="s-manip">-</strong><small id="s-manip-sub">-</small></div>
   </div>

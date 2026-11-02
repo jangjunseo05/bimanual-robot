@@ -26,13 +26,13 @@ const START_HINT = {
 const DRINKS = { COLD_WATER: "냉수", HOT_WATER: "온수", LEMONADE: "레몬에이드", COLA: "콜라" };
 const MISSION_LABEL = { RUNNING: "진행 중", TERMINAL: "정지 대기" };
 const DRIVE_LABEL = { running: "주행 중", stopped: "정지", succeeded: "완료", complete: "완료", failed: "실패", idle: "대기" };
+// 주행 PC 칸의 현재 상태(tools/jdamr/water_service.py의 단계 이름)
+const DRIVE_PHASE_LABEL = {
+  ...DRIVE_LABEL, checking_inference: "추론 확인 중", navigation_cycle: "주행 중", parking: "주방 이동·주차", inferencing: "물따르기 대기",
+  parking_table_one: "테이블 이동·주차", table_one_and_dock: "테이블·도크 주행", placing_cup: "컵배치 대기", returning_to_dock: "도크 복귀", stopping: "정지 중", interrupted: "중단됨",
+};
 const MANIP_LABEL = { ready: "준비됨", running: "실행 중", loading: "로딩 중", unreachable: "연결 안 됨" };
 const TASK_LABEL = { pour: "물따르기", place: "컵배치", stow: "팔 접기", stow_right: "오른팔 접기" };
-// 퍼센트 환산 기준 [0 %, 100 %] 전압. 저장소에 근거가 없어 비워 두며, 비어 있으면 볼트만 표시한다.
-const BATTERY_RANGE_V = { arm: null, pi: null };
-// 경고 전압: 팔은 tools/rollout/arm_health.py, 파이는 restaurant_service_contract.yaml(출발 10.8 V, 주행 10.5 V)
-const BATTERY_ALERT_V = { arm: { warn: 9.0, bad: 9.0 }, pi: { warn: 10.8, bad: 10.5 } };
-
 // 파이 주행 대시보드(ammr_dashboard)가 구독하는 토픽과 스냅샷 안의 위치
 const vel = (v) => v.linear_mps != null ? `v ${v.linear_mps.toFixed(2)} · ω ${v.angular_rps.toFixed(2)}` : "";
 const TOPICS = [
@@ -146,6 +146,9 @@ async function refresh() {
   } catch {
     $("conn").textContent = "서버 연결 끊김 — 재연결 중";
     $("conn").className = "conn bad";
+    $("s-drive").textContent = "확인 불가";
+    $("s-drive-sub").textContent = "주문 서버 응답 없음";
+    setDot("k-drive-dot", "");
   }
 }
 
@@ -187,7 +190,6 @@ function render() {
   } : sim ? simManip() : null;
   renderManip(manip, sim && !eb.manipulation_service_state);
 
-  renderBatteries(eb);
 
   // 정렬 완료 신호 대기 (rollout-service backend). 주행 연동 전에는 운영자가 확인 후 누른다.
   const waiting = eb.waiting_alignment;
@@ -224,6 +226,11 @@ function renderRunControls() {
     : `주행 PC 연결 · ${link.dry_run ? "감지만 · " : ""}${DRIVE_LABEL[link.phase || link.state] || link.phase || link.state || "-"}${link.error ? ` · ${link.error.slice(0, 80)}` : ""}`;
   $("drive-link").parentElement.title = $("drive-link").textContent;
   $("drive-link").className = link && !link.connected ? "conn bad" : "conn";
+  // 제목 줄과 같은 drive_link.connected로 판정한다. 끊긴 뒤의 값은 지난 상태라 보여 주지 않는다.
+  const driveState = link?.connected ? DRIVE_PHASE_LABEL[link.phase] || DRIVE_PHASE_LABEL[link.state] : null;
+  $("s-drive").textContent = link?.connected ? "연결됨" : "미연결";
+  $("s-drive-sub").textContent = driveState ? `${link.dry_run ? "감지만 · " : ""}${driveState}` : "주행 상태 없음";
+  setDot("k-drive-dot", link?.connected ? "ok" : link ? "bad" : "");
   const noDrive = link && !link.connected ? " · 주행 PC 미연결: 차는 출발하지 않습니다" : "";
   $("start-hint").textContent = start.ready ? `START: 주문 ${no(start.order_id)}${noDrive}` : START_HINT[start.reason] || start.reason || "";
   const init = state.drive_init || {};
@@ -283,32 +290,6 @@ function renderFsm(active, tickets) {
   }));
 }
 
-// 배터리: 값이 없으면 가짜 값 대신 연결 안 됨으로 표시한다. battery_percent(미션 모델 추정값)는 실측이 아니라 쓰지 않는다.
-function showBattery(id, kind, voltage, source) {
-  const range = BATTERY_RANGE_V[kind];
-  const alert = BATTERY_ALERT_V[kind];
-  if (!Number.isFinite(voltage)) {
-    $(id).textContent = "연결 안 됨";
-    $(`${id}-sub`).textContent = source;
-    setDot(`${id}-dot`, "");
-    return;
-  }
-  const volts = `${voltage.toFixed(kind === "pi" ? 2 : 1)} V`;
-  const percent = range ? Math.round(Math.min(1, Math.max(0, (voltage - range[0]) / (range[1] - range[0]))) * 100) : null;
-  $(id).textContent = percent == null ? volts : `${percent} % · ${volts}`;
-  $(`${id}-sub`).textContent = percent == null ? "퍼센트 기준 미정" : "전압 환산";
-  setDot(`${id}-dot`, voltage < alert.bad ? "bad" : voltage < alert.warn ? "warn" : "ok");
-}
-function renderBatteries(eb) {
-  const nav = state.robot_nav;
-  const arm = (side) => eb.arm_batteries?.[side];
-  const armSource = eb.manipulation_service_state ? "실행기가 전압을 보내지 않음" : "조작 실행기 없음";
-  showBattery("b-left", "arm", arm("left"), armSource);
-  showBattery("b-right", "arm", arm("right"), armSource);
-  const pi = nav?.connected ? nav.snapshot?.battery : null;
-  showBattery("b-pi", "pi", pi?.live ? pi.voltage_v : NaN, !nav ? "주행 대시보드 미연결" : nav.connected ? "전압 수신 없음" : "주행 대시보드 연결 실패");
-}
-
 // rollout_service /status 의 arms 값
 const ARMS_KO = { stowed: "이동 자세", carrying_cup: "컵 유지·오른팔 접힘", busy: "동작 중", hold: "그 자리 유지(확인 필요)", unknown: "미확인" };
 
@@ -345,6 +326,16 @@ function renderTopics() {
     tr.title = `${name} · ${text || "-"} · 경과 ${age}`;
     return tr;
   }));
+  if (nav) {
+    const odom = nav.motion?.odom || {};
+    $("s-nav").textContent = `${liveCount}/${TOPICS.length} topics live`;
+    $("s-nav-sub").textContent = odom.linear_mps != null ? `v ${odom.linear_mps.toFixed(2)} m/s · goal ${nav.navigation?.goal?.status || "-"}` : "-";
+    setDot("k-nav-dot", liveCount >= TOPICS.length - 2 ? "ok" : "warn");
+  } else {
+    $("s-nav").textContent = "not connected";
+    $("s-nav-sub").textContent = feed?.error || "--robot-pose-url 미설정";
+    setDot("k-nav-dot", feed ? "bad" : "");
+  }
   $("topic-tag").textContent = nav ? `${liveCount}/${TOPICS.length} 수신` : "미연결";
   $("topic-tag").className = `tag ${nav ? "ok" : ""}`;
   const parts = [];
@@ -591,6 +582,9 @@ function renderMapInfo() {
   src.className = label === "LIVE" ? "pose-live" : "pose-est";
   if (!pose) return;
   const where = `(${pose.x_m.toFixed(2)}, ${pose.y_m.toFixed(2)}) m · ${pose.yaw_deg.toFixed(0)}°`;
+  $("s-location").textContent = `${label === "LIVE" ? "LIVE" : label === "LAST" ? "LAST KNOWN" : "ESTIMATED"} · ${place(state.current_location)}`;
+  $("s-loc-sub").textContent = where;
+  setDot("k-loc-dot", label === "LIVE" ? "ok" : label === "LAST" ? "bad" : "warn");
   const reason = label === "LIVE" ? "" : state.robot_pose?.error ? ` · 수신 실패: ${state.robot_pose.error}` : " · 실시간 위치 미연결, 진행 단계로 추정";
   $("map-note").textContent = `${where}${reason}`;
   $("map-note").title = $("map-note").textContent;
