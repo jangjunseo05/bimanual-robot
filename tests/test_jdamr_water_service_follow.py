@@ -115,3 +115,106 @@ def test_rehearsal_service_folds_and_stops_without_hardware():
     finally:
         server.shutdown()
         server.server_close()
+
+
+def init_state(request_id='i1', state='requested', **order):
+    return {**order_state(**order), 'drive_init': {'id': request_id, 'state': state}}
+
+
+@pytest.fixture
+def helper(tmp_path, monkeypatch):
+    """Replace jdamr_depart.py; it records its arguments and ends with the given line and code."""
+    calls = tmp_path / 'calls.txt'
+
+    def install(last_line, code=0):
+        script = tmp_path / 'jdamr_depart.py'
+        script.write_text(
+            'import sys\n'
+            f'open({str(calls)!r}, "a").write(" ".join(sys.argv[1:]) + "\\n")\n'
+            f'print({last_line!r})\n'
+            f'raise SystemExit({code})\n')
+        monkeypatch.setattr(water_service, 'DEPART_HELPER', script)
+        return calls
+    return install
+
+
+def finish_init(node):
+    node._init_thread.join(timeout=10)
+    assert not node._init_thread.is_alive()
+    return node._init_report
+
+
+def test_requested_init_runs_once_and_reports_success(controller, helper):
+    calls = helper('init complete: robot localized')
+    assert controller.follow_web(init_state()) == 'init i1'
+    assert finish_init(controller) == {
+        'id': 'i1', 'state': 'succeeded', 'message': 'init complete: robot localized'}
+    assert calls.read_text().split()[-1] == 'init'
+    assert controller.follow_web(init_state()) is None
+    assert len(calls.read_text().splitlines()) == 1
+
+
+def test_init_failure_reports_the_stop_line(controller, helper):
+    helper('STOP: activation failed', code=1)
+    controller.follow_web(init_state())
+    assert finish_init(controller) == {
+        'id': 'i1', 'state': 'failed', 'message': 'STOP: activation failed'}
+
+
+def test_init_result_goes_out_with_the_heartbeat(controller, helper):
+    helper('init complete')
+    controller.follow_web(init_state())
+    finish_init(controller)
+    controller._http_json = Mock()
+    controller.report_web(dry_run=False)
+    assert controller._http_json.call_args.kwargs['body']['init']['state'] == 'succeeded'
+
+
+def test_init_does_not_run_during_a_mission(controller, helper):
+    calls = helper('init complete')
+    release = mark_running(controller)
+    try:
+        assert controller.follow_web(init_state()) is None
+    finally:
+        release.set()
+    assert controller._init_thread is None
+    assert not calls.exists()
+
+
+def test_stop_outranks_a_requested_init(controller, helper):
+    helper('init complete')
+    assert controller.follow_web(init_state(emergency=True)) is None
+    assert controller._init_thread is None
+
+
+def test_dry_run_reports_init_and_runs_nothing(controller, helper):
+    helper('init complete')
+    assert controller.follow_web(init_state(), dry_run=True) == 'would_init i1'
+    assert controller.follow_web(init_state(), dry_run=True) is None
+    assert controller._init_thread is None
+
+
+def test_departure_waits_for_a_running_init(controller):
+    release = threading.Event()
+    controller._init_thread = threading.Thread(target=release.wait, daemon=True)
+    controller._init_thread.start()
+    try:
+        assert controller.follow_web(order_state()) is None
+        controller.start.assert_not_called()
+    finally:
+        release.set()
+
+
+def test_mission_start_is_refused_during_init(tmp_path):
+    pointer = tmp_path / 'map.json'
+    pointer.write_text('{}')
+    node = water_service.WaterServiceController(
+        inference_url='http://order.invalid', state_directory=tmp_path / 'state', map_session=pointer)
+    release = threading.Event()
+    node._init_thread = threading.Thread(target=release.wait, daemon=True)
+    node._init_thread.start()
+    try:
+        with pytest.raises(RuntimeError, match='init is running'):
+            node.start('web-A')
+    finally:
+        release.set()

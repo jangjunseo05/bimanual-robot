@@ -16,6 +16,7 @@ import time
 from collections import deque
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+from uuid import uuid4
 
 from src.mission.service_execution_backend import CommandBackend, ImmediateBackend, Ros2ManipulationBackend, Ros2PlannedArtifactBackend, Ros2PlannedRoundtripBackend, Ros2PlannedSessionBackend, RolloutServiceBackend
 from src.mission.service_mission_control import DryRunRuntime, MissionController, ORDER_STATES, OrderStateError
@@ -50,6 +51,9 @@ ASSET_TYPES = {"jpg": "image/jpeg", "png": "image/png", "json": "application/jso
 CLIENT_REF_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
 ORDER_NO_DIGITS = 3  # 주문 번호 = YYMMDD + 일련번호 3자리 (예: 261027001)
 DRIVE_LINK_TIMEOUT_S = 3.0  # 주행 PC 보고가 이보다 오래 없으면 미연결로 표시한다
+DRIVE_INIT_PICKUP_TIMEOUT_S = 5.0  # 주행 PC가 이 안에 초기화 요청을 가져가지 않으면 실패로 표시한다
+DRIVE_INIT_IDLE = {"id": None, "state": "idle", "message": None, "requested": None}
+DRIVE_INIT_ACTIVE = ("requested", "running")
 
 
 def _trim(value, depth: int = 0):
@@ -172,6 +176,8 @@ class ServiceApplication:
         # 긴급 정지 잠금: 해제할 때까지 다음 단계와 Start를 막는다. 주행 쪽은 /api/state 로 읽는다.
         self.emergency: dict = {"active": False, "at": None, "order_id": None}
         self.drive_link: dict | None = None
+        # 주행 초기화 요청: 주행 PC가 /api/state 로 읽어 실행하고 heartbeat 로 결과를 알린다.
+        self.drive_init: dict = dict(DRIVE_INIT_IDLE)
         # 주문표: 주문 번호별 메뉴 줄(로봇 음료 + 직원이 가져다주는 음식). 로봇 미션은 음료만 맡는다.
         self.tickets: dict[str, dict] = self._load_tickets()
         self.pose_feed: RobotPoseFeed | None = None
@@ -280,6 +286,7 @@ class ServiceApplication:
             snapshot["emergency_stop"] = dict(self.emergency)
             snapshot["start"] = self._start_status(snapshot["execution_backend"])
             snapshot["drive_link"] = self._drive_link_status()
+            snapshot["drive_init"] = self._drive_init_status()
             snapshot["tickets"] = list(self.tickets.values())
             snapshot["robot_pose"] = self.pose_feed.pose if self.pose_feed is not None else None
             snapshot["robot_nav"] = self.pose_feed.nav if self.pose_feed is not None else None
@@ -298,6 +305,7 @@ class ServiceApplication:
         with self.lock:
             self.drive_link = {"received": time.monotonic(),
                                **{k: payload.get(k) for k in ("state", "phase", "mission_id", "error", "dry_run")}}
+            self._update_drive_init(payload.get("init"))
             return {"ok": True}
 
     def _drive_link_status(self) -> dict:
@@ -307,6 +315,58 @@ class ServiceApplication:
         return {**{k: v for k, v in self.drive_link.items() if k != "received"},
                 "connected": age_s < DRIVE_LINK_TIMEOUT_S, "age_s": round(age_s, 1)}
 
+    def _update_drive_init(self, report: Any) -> None:
+        if self.drive_init["state"] not in DRIVE_INIT_ACTIVE:
+            return
+        report = report if isinstance(report, dict) else {}
+        outcome = report.get("state")
+        if report.get("id") == self.drive_init["id"] and outcome in ("running", "succeeded", "failed"):
+            self.drive_init.update(state=outcome, message=report.get("message"))
+            if outcome != "running":
+                self.controller.record_event(f"DRIVE_INIT_{outcome.upper()}")
+                self._persist()
+        elif self.drive_init["state"] == "running":
+            # 주행 PC 실행기가 재시작되면 진행 중이던 초기화를 잃는다.
+            self.drive_init.update(state="failed", message="주행 PC가 진행 중인 초기화를 보고하지 않습니다")
+
+    def _expire_drive_init(self) -> None:
+        requested = self.drive_init["requested"]
+        if (self.drive_init["state"] == "requested"
+                and time.monotonic() - requested > DRIVE_INIT_PICKUP_TIMEOUT_S):
+            self.drive_init.update(state="failed", message="주행 PC가 초기화 요청을 가져가지 않았습니다")
+
+    def _drive_init_block(self) -> str | None:
+        """Why init may not run now.  An order ends at cup placement while the car still returns to the dock."""
+        link = self._drive_link_status()
+        if self.emergency["active"]:
+            return "emergency_stop"
+        if self.controller.active_order is not None or link.get("state") == "running":
+            return "mission_running"
+        if not link["connected"]:
+            return "drive_not_connected"
+        if self.drive_init["state"] in DRIVE_INIT_ACTIVE:
+            return "drive_init_running"
+        return None
+
+    def _drive_init_status(self) -> dict:
+        self._expire_drive_init()
+        reason = self._drive_init_block()
+        return {**{k: self.drive_init[k] for k in ("id", "state", "message")},
+                "ready": reason is None, "reason": reason}
+
+    def request_drive_init(self) -> dict:
+        """Control page init: the drive PC reads this request and runs jdamr_depart.py init, which sends no motion."""
+        with self.lock:
+            self._expire_drive_init()
+            reason = self._drive_init_block()
+            if reason is not None:
+                raise OrderStateError(reason)
+            self.drive_init = {**DRIVE_INIT_IDLE, "id": uuid4().hex[:8], "state": "requested",
+                               "requested": time.monotonic()}
+            self.controller.record_event("DRIVE_INIT_REQUESTED")
+            self._persist()
+            return {"drive_init": self._drive_init_status()}
+
     def _start_status(self, backend_info: dict) -> dict:
         """Whether the control page Start may run now, and the order it would release."""
         accepted = self.controller.accepted_orders()
@@ -315,6 +375,8 @@ class ServiceApplication:
             reason = "emergency_stop"
         elif self.controller.active_order is not None:
             reason = "mission_running"
+        elif self.drive_init["state"] in DRIVE_INIT_ACTIVE:
+            reason = "drive_init_running"
         elif not accepted:
             reason = "no_accepted_order"
         elif backend_info.get("manipulation_service_state") not in (None, "ready"):
@@ -350,6 +412,8 @@ class ServiceApplication:
             if not status["ready"]:
                 raise OrderStateError(status["reason"])
             order = self.controller.start_next()
+            # 초기화 결과는 한 회차용이다. 다음 회차 전에 다시 눌러야 하므로 표시를 지운다.
+            self.drive_init = dict(DRIVE_INIT_IDLE)
             self._persist()
             return {"order": order.__dict__, "state": self.controller.snapshot()}
 
@@ -745,6 +809,9 @@ def handler_factory(app: ServiceApplication, cors_origin: str | None = None) -> 
                     return
                 if path == "/api/drive/heartbeat":
                     self._json(HTTPStatus.OK, app.drive_heartbeat(self._read_json()))
+                    return
+                if path == "/api/drive/init":
+                    self._json(HTTPStatus.OK, app.request_drive_init())
                     return
                 if path == "/api/mission/start":
                     self._json(HTTPStatus.OK, app.start_mission())

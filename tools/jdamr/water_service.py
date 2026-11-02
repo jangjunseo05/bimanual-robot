@@ -25,6 +25,8 @@ from uuid import uuid4
 
 DEPART_HELPER = Path(__file__).with_name("jdamr_depart.py")
 DEFAULT_MAP_POINTER = Path.home() / "jdamr_data/maps/current_manual_mapping.json"
+INIT_TIMEOUT_S = 300.0  # activation alone may take 240 s
+INIT_MESSAGE_CHARS = 200
 
 
 class _Stopped(RuntimeError):
@@ -59,6 +61,8 @@ class WaterServiceController:
         self._worker_thread: threading.Thread | None = None
         self._process: subprocess.Popen[str] | None = None
         self._log_path: Path | None = None
+        self._init_thread: threading.Thread | None = None
+        self._init_report: dict[str, Any] | None = None
         self._state = self._load_state()
         self._announced: set[str] = set()
         if self._state.get("state") == "running":
@@ -87,6 +91,8 @@ class WaterServiceController:
                 return response
             if self._worker_thread is not None and self._worker_thread.is_alive():
                 raise RuntimeError("another water-service mission is already running")
+            if self._init_running():
+                raise RuntimeError("init is running; refusing to start a mission")
 
             mission_id = time.strftime("%Y%m%d_%H%M%S") + "_" + uuid4().hex[:8]
             mission_dir = self.state_directory / "runs" / mission_id
@@ -192,10 +198,11 @@ class WaterServiceController:
         """Tell the control page that this PC follows it and what the mission is doing."""
         with self._lock:
             body = {key: self._state.get(key) for key in ("state", "phase", "mission_id", "error")}
+            body["init"] = self._init_report
         self._http_json("POST", "/api/drive/heartbeat", timeout_s=2.0, body={**body, "dry_run": dry_run})
 
     def follow_web(self, state: dict[str, Any], *, dry_run: bool = False) -> str | None:
-        """Act once on the order server state: STOP first, otherwise depart for a newly started order.
+        """Act once on the order server state: STOP first, then a requested init, then a newly started order.
 
         The arms-ready kitchen request is the departure signal, so nothing moves before the
         control page Start has folded the arms.  With dry_run only the decision is reported.
@@ -210,8 +217,11 @@ class WaterServiceController:
                 self.stop()
                 return "stop"
             return None
-        if running:
+        if running or self._init_running():
             return None
+        init = state.get("drive_init") or {}
+        if init.get("state") == "requested":
+            return self._start_init(str(init.get("id")), dry_run)
         backend = state.get("execution_backend") or {}
         drive = backend.get("drive") or {}
         waiting = backend.get("waiting_alignment") or {}
@@ -227,6 +237,46 @@ class WaterServiceController:
                 return None
         self.start(request_id)
         return f"start {order_id}"
+
+    def _init_running(self) -> bool:
+        with self._lock:
+            return self._init_thread is not None and self._init_thread.is_alive()
+
+    def _start_init(self, request_id: str, dry_run: bool) -> str | None:
+        if dry_run:
+            return self._announce_once(f"init-{request_id}", f"would_init {request_id}")
+        with self._lock:
+            if self._init_report is not None and self._init_report["id"] == request_id:
+                return None
+            self._init_report = {"id": request_id, "state": "running", "message": None}
+            self._init_thread = threading.Thread(
+                target=self._run_init, args=(request_id,), name=f"water-service-init-{request_id}", daemon=True
+            )
+            self._init_thread.start()
+        return f"init {request_id}"
+
+    def _run_init(self, request_id: str) -> None:
+        """Run the maintained init for the control page; it localizes at the dock and sends no motion."""
+        log_path = self.state_directory / "init" / f"{time.strftime('%Y%m%d_%H%M%S')}_{request_id}.log"
+        command = [sys.executable, str(DEPART_HELPER), "--map-session", str(self.map_session), "init"]
+        try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with log_path.open("w", encoding="utf-8") as output:
+                code = subprocess.run(
+                    command,
+                    cwd=str(DEPART_HELPER.parents[2]),
+                    stdout=output,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    timeout=INIT_TIMEOUT_S,
+                ).returncode
+            lines = log_path.read_text(encoding="utf-8", errors="replace").strip().splitlines()
+            outcome = "succeeded" if code == 0 else "failed"
+            message = lines[-1] if lines else f"init exited with code {code}"
+        except (OSError, subprocess.SubprocessError) as error:
+            outcome, message = "failed", str(error)
+        with self._lock:
+            self._init_report = {"id": request_id, "state": outcome, "message": message[-INIT_MESSAGE_CHARS:]}
 
     def _announce_once(self, key: str, message: str) -> str | None:
         if key in self._announced:

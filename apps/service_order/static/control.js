@@ -21,6 +21,8 @@ const START_HINT = {
   mission_running: "진행 중인 미션이 있습니다",
   no_accepted_order: "수락한 주문이 없습니다",
   manipulation_not_ready: "조작 실행기가 준비되지 않았습니다",
+  drive_init_running: "주행 초기화 중입니다",
+  drive_not_connected: "주행 PC가 연결되지 않았습니다",
 };
 const DRINKS = { COLD_WATER: "냉수", HOT_WATER: "온수", LEMONADE: "레몬에이드", COLA: "콜라" };
 // 파이 주행 대시보드(ammr_dashboard)가 구독하는 토픽과 스냅샷 안의 위치
@@ -251,6 +253,13 @@ function renderRunControls() {
   $("drive-link").className = link && !link.connected ? "conn bad" : "conn";
   const noDrive = link && !link.connected ? " · 주행 PC 미연결: 차는 출발하지 않습니다" : "";
   $("start-hint").textContent = start.ready ? `START: 주문 ${no(start.order_id)}${noDrive}` : START_HINT[start.reason] || start.reason || "";
+  const init = state.drive_init || {};
+  const initActive = ["requested", "running"].includes(init.state);
+  $("drive-init").disabled = !init.ready;
+  $("drive-init").textContent = initActive ? "초기화 중…" : "주행 초기화";
+  $("drive-init").title = START_HINT[init.reason] || "";
+  $("init-hint").textContent = init.state === "succeeded" ? "주행 초기화 완료"
+    : init.state === "failed" ? `주행 초기화 실패: ${(init.message || "").slice(0, 120)}` : "";
   const stop = state.emergency_stop || {};
   $("estop-banner").hidden = !stop.active;
   if (stop.active) {
@@ -490,6 +499,11 @@ $("align-confirm").addEventListener("click", () => {
   }
 });
 $("pause").addEventListener("click", () => act(() => api("/api/control", { paused: !state?.auto_paused })));
+$("drive-init").addEventListener("click", () => {
+  if (confirm("차가 도크에 있나요?\n차는 움직이지 않고 Nav2를 켜서 위치만 다시 잡습니다.")) {
+    act(() => api("/api/drive/init", {}));
+  }
+});
 $("start").addEventListener("click", () => {
   const id = state?.start?.order_id;
   if (id && confirm(`주문 ${no(id)}을(를) 시작할까요?\n팔이 접히고 전체 시나리오가 시작됩니다.`)) {

@@ -1,3 +1,4 @@
+import importlib.util
 import json
 from http.server import ThreadingHTTPServer
 import os
@@ -12,7 +13,7 @@ from urllib.request import Request, urlopen
 
 import pytest
 
-from src.mission.service_mission_control import MissionController
+from src.mission.service_mission_control import MissionController, OrderStateError
 import src.mission.service_execution_backend as service_execution_backend
 from src.mission.service_execution_backend import BackendResult, ImmediateBackend, Ros2ManipulationBackend, Ros2PlannedRoundtripBackend, Ros2PlannedSessionBackend
 from apps.service_order.service_order_server import API_JS, BackendBusyError, CONTROL_JS, CONTROL_PAGE, DASHBOARD_JS, INDEX, ORDER_JS, ORDER_PAGE, ServiceApplication, auto_step, default_state_dir, handler_factory
@@ -743,3 +744,120 @@ def test_roundtrip_constructor_requires_fresh_scoped_physics_executor(monkeypatc
             executor_socket=tmp_path / "executor.sock",
             timeout_sec=4.0,
         )
+
+
+def _gated_app(tmp_path):
+    return ServiceApplication(MissionController(require_operator=True), tmp_path / "state", ImmediateBackend())
+
+
+def _accepted_order(app):
+    order_id = app.submit({"table_id": "table_1", "drink": "COLD_WATER"})[0]["order"]["order_id"]
+    app.accept(order_id)
+    return order_id
+
+
+def _link_drive(app, state=None):
+    app.drive_heartbeat({"state": state, "phase": None, "mission_id": None, "error": None, "dry_run": False})
+
+
+def test_drive_init_needs_a_connected_idle_drive_pc(tmp_path):
+    app = _gated_app(tmp_path)
+    with pytest.raises(OrderStateError, match="drive_not_connected"):
+        app.request_drive_init()
+    assert app.state()["drive_init"]["ready"] is False
+
+    # 주문은 컵배치에서 끝나지만 차는 아직 도크로 돌아오는 중이다.
+    _link_drive(app, "running")
+    assert app.state()["active_order_id"] is None
+    with pytest.raises(OrderStateError, match="mission_running"):
+        app.request_drive_init()
+
+    _link_drive(app, "succeeded")
+    app.emergency_stop()
+    with pytest.raises(OrderStateError, match="emergency_stop"):
+        app.request_drive_init()
+    app.reset_emergency_stop()
+
+    assert app.state()["drive_init"]["ready"] is True
+    _accepted_order(app)
+    assert app.state()["drive_init"]["ready"] is True
+    app.start_mission()
+    with pytest.raises(OrderStateError, match="mission_running"):
+        app.request_drive_init()
+    app.close()
+
+
+def test_drive_init_blocks_start_until_its_result_and_start_clears_it(tmp_path):
+    app = _gated_app(tmp_path)
+    _link_drive(app)
+    _accepted_order(app)
+    request_id = app.request_drive_init()["drive_init"]["id"]
+    assert app.state()["drive_init"]["state"] == "requested"
+    assert app.state()["start"]["reason"] == "drive_init_running"
+    with pytest.raises(OrderStateError, match="drive_init_running"):
+        app.request_drive_init()
+
+    app.drive_heartbeat({"init": {"id": request_id, "state": "running", "message": None}})
+    assert app.state()["drive_init"]["state"] == "running"
+    assert app.state()["start"]["ready"] is False
+
+    app.drive_heartbeat({"init": {"id": request_id, "state": "succeeded", "message": "init complete"}})
+    state = app.state()
+    assert state["drive_init"]["state"] == "succeeded"
+    assert state["drive_init"]["message"] == "init complete"
+    assert state["start"]["ready"] is True
+
+    app.start_mission()
+    assert app.state()["drive_init"]["state"] == "idle"
+    app.close()
+
+
+def test_unclaimed_or_lost_drive_init_becomes_a_failure(tmp_path):
+    app = ServiceApplication(MissionController(), tmp_path / "state")
+    _link_drive(app)
+    request_id = app.request_drive_init()["drive_init"]["id"]
+    app.drive_init["requested"] -= 60
+    assert app.state()["drive_init"]["state"] == "failed"
+
+    _link_drive(app)
+    request_id = app.request_drive_init()["drive_init"]["id"]
+    app.drive_heartbeat({"init": {"id": "stale", "state": "succeeded", "message": None}})
+    assert app.state()["drive_init"]["state"] == "requested"
+    app.drive_heartbeat({"init": {"id": request_id, "state": "running", "message": None}})
+    app.drive_heartbeat({"init": None})
+    assert app.state()["drive_init"]["state"] == "failed"
+    app.close()
+
+
+def test_control_page_init_reaches_the_drive_pc_and_returns_its_result(server, tmp_path, monkeypatch):
+    app, base, _ = server
+    spec = importlib.util.spec_from_file_location(
+        "water_service_init", Path(__file__).resolve().parents[2] / "tools/jdamr/water_service.py")
+    water_service = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(water_service)
+    script = tmp_path / "jdamr_depart.py"
+    script.write_text('print("init complete: no motion sent")\n')
+    monkeypatch.setattr(water_service, "DEPART_HELPER", script)
+    drive = water_service.WaterServiceController(inference_url=base, state_directory=tmp_path / "drive")
+
+    with pytest.raises(HTTPError) as refused:
+        post_json(f"{base}/api/drive/init", {})
+    assert refused.value.code == 409
+
+    drive.report_web(dry_run=False)
+    status, body = post_json(f"{base}/api/drive/init", {})
+    assert status == 200
+    request_id = body["drive_init"]["id"]
+
+    assert drive.follow_web(drive.read_web_state()) == f"init {request_id}"
+    drive.report_web(dry_run=False)
+    drive._init_thread.join(timeout=10)
+    drive.report_web(dry_run=False)
+    result = drive.read_web_state()["drive_init"]
+    assert (result["state"], result["message"]) == ("succeeded", "init complete: no motion sent")
+    assert result["ready"] is True
+
+
+def test_control_page_has_the_drive_init_button():
+    assert 'id="drive-init"' in CONTROL_PAGE.read_text(encoding="utf-8")
+    assert '"/api/drive/init"' in CONTROL_JS.read_text(encoding="utf-8")

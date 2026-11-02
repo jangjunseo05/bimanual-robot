@@ -241,8 +241,9 @@ python3 tools/jdamr/water_service_api.py serve --order-url http://192.168.0.157:
   `drive.next=kitchen`, `arms_ready=true`가 모두 참일 때 `web-<주문 번호>` 요청으로 한 번만 시작한다.
 - STOP(`emergency_stop.active`)은 진행 중 미션을 멈추고 새 출발을 막는다. 주행 중 감시도 같은 값을 읽어 도크 복귀 구간까지 멈춘다.
 - 차를 멈추는 경로는 `jdamr_depart.py stop`이다. 정지까지의 실제 지연은 측정 전이다.
-- `--follow-dry-run`을 더하면 판단만 `follow: would_start <주문>`, `follow: would_stop`으로 출력하고 아무것도 시작·정지하지 않는다.
+- `--follow-dry-run`을 더하면 판단만 `follow: would_start <주문>`, `follow: would_stop`, `follow: would_init <요청>`으로 출력하고 아무것도 시작·정지하지 않는다.
 - 이 PC의 상태는 `/api/drive/heartbeat`로 보고되어 관제 화면 제목 아래에 표시된다. 3초 넘게 보고가 없으면 미연결로 표시한다.
+- 관제 화면의 `주행 초기화`는 `POST /api/drive/init`으로 요청을 남기고, `--follow-web` 실행기가 이를 읽어 `jdamr_depart.py init`을 실행한다. 차는 움직이지 않는다. 결과와 마지막 출력 줄은 heartbeat로 화면에 표시하고, 전체 출력은 상태 폴더의 `init/`에 남긴다. 미션 중, 도크 복귀 중, STOP 중, 주행 PC 미연결일 때는 거부하고, 초기화 중에는 START를 막는다. `session-start`는 대신하지 않는다.
 - 조작 실행기 없이 연결만 시험할 때는 Windows에서 `tools/rollout/start_scenario.bat` 대신
   `tools/rollout/rehearsal_service.py`와 주문 서버만 켠다. 가짜 실행기는 하드웨어를 열지 않는다.
 - 주문 서버는 수락과 START 전에는 주문을 시작하지 않는다. `--follow-web` 없이 `start`만 실행하면
