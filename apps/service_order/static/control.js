@@ -326,16 +326,6 @@ function renderTopics() {
     tr.title = `${name} · ${text || "-"} · 경과 ${age}`;
     return tr;
   }));
-  if (nav) {
-    const odom = nav.motion?.odom || {};
-    $("s-nav").textContent = `${liveCount}/${TOPICS.length} topics live`;
-    $("s-nav-sub").textContent = odom.linear_mps != null ? `v ${odom.linear_mps.toFixed(2)} m/s · goal ${nav.navigation?.goal?.status || "-"}` : "-";
-    setDot("k-nav-dot", liveCount >= TOPICS.length - 2 ? "ok" : "warn");
-  } else {
-    $("s-nav").textContent = "not connected";
-    $("s-nav-sub").textContent = feed?.error || "--robot-pose-url 미설정";
-    setDot("k-nav-dot", feed ? "bad" : "");
-  }
   $("topic-tag").textContent = nav ? `${liveCount}/${TOPICS.length} 수신` : "미연결";
   $("topic-tag").className = `tag ${nav ? "ok" : ""}`;
   const parts = [];

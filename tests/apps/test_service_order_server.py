@@ -174,9 +174,9 @@ def test_control_page_keeps_operator_controls_in_one_screen():
     html = CONTROL_PAGE.read_text(encoding="utf-8")
     javascript = CONTROL_JS.read_text(encoding="utf-8")
     for control in ("drive-init", "start", "stop", "estop-reset", "align-confirm", "queue", "staff",
-                    "topics", "commands", "events", "t-step", "t-fail", "s-drive", "s-nav", "s-location", "s-mission", "s-manip"):
+                    "topics", "commands", "events", "t-step", "t-fail", "s-drive", "s-location", "s-mission", "s-manip"):
         assert f'id="{control}"' in html
-    for removed in ("pause", "history", "f-submit", "b-left", "b-right", "b-pi", "s-battery"):
+    for removed in ("pause", "history", "f-submit", "b-left", "b-right", "b-pi", "s-battery", "s-nav"):
         assert f'id="{removed}"' not in html
     assert "overflow: hidden" in html.split("@media")[0]
     assert "JSON.stringify(cmd" not in javascript
