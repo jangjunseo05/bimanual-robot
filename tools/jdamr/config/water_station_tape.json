@@ -3,6 +3,7 @@
   "table_front_tape": {
     "goal_front_from_base_m": 0.075,
     "maximum_yaw_rad": 0.5,
+    "maximum_lateral_m": 0.4,
     "provenance": {
       "front_extent_source": "new_base_geometry.yaml front_to_wheel_axis.value=0.065 plus target_front_gap_m=0.01",
       "projection": "upper strip ends at tabletop edge; reference tabletop plane retained; no inferred mounting change",

@@ -56,6 +56,7 @@
 
 ## 실험과 장애 기록
 
+- [급수대 깊이 입력 지연 트러블슈팅](../src/navigation/jdamr_cube_navigation/evaluation/20261103_DEPTH_LATENCY_TROUBLESHOOTING.md) — 대기·재개 집계, Wi-Fi·Pi 처리 지연의 확인 범위와 미확정 원인
 - [20260904_그리퍼_출력_인계](experiments/20260904_그리퍼_출력_인계.md)
 - [20260908_물서빙로봇_무선운용과_SLAM_ACT_팀보고](experiments/20260908_물서빙로봇_무선운용과_SLAM_ACT_팀보고.md)
 - [20260909_그리퍼_서보_Phase반전_사고분석](experiments/20260909_그리퍼_서보_Phase반전_사고분석.md)

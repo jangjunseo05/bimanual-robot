@@ -18,6 +18,7 @@ import secrets
 import signal
 import sys
 import threading
+import time
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -110,11 +111,16 @@ class _MissionHandler(BaseHTTPRequestHandler):
         return value
 
     def do_GET(self) -> None:
-        if self.path not in ("/api/mission/status", "/status"):
+        if self.path not in ("/api/mission/status", "/status", "/api/mission/logs"):
             self._send(404, {"error": "not found"})
             return
         if self._authorized():
-            self._send(200, self.server.controller.status())
+            try:
+                result = (self.server.controller.logs() if self.path == "/api/mission/logs"
+                          else self.server.controller.status())
+                self._send(200, result)
+            except (OSError, RuntimeError, ValueError) as error:
+                self._send(503, {"error": str(error)})
 
     def do_POST(self) -> None:
         routes = {
@@ -202,10 +208,10 @@ def _follow_web(controller: WaterServiceController, done: threading.Event, dry_r
 
 
 def _client_request(url: str, token: str, action: str, request_id: str | None) -> int:
-    path = "/api/mission/status" if action == "status" else f"/api/mission/{action}"
+    path = f"/api/mission/{action}"
     payload = None
     method = "GET"
-    if action != "status":
+    if action not in ("status", "logs"):
         body = {"request_id": request_id} if action == "start" and request_id else {}
         payload = _json_bytes(body)
         method = "POST"
@@ -233,6 +239,40 @@ def _client_request(url: str, token: str, action: str, request_id: str | None) -
     return 0 if 200 <= status < 300 else 1
 
 
+def _watch_logs(url: str, token: str) -> int:
+    """Stream read-only progress; closing the viewer sends no robot command."""
+    previous = None
+    latest = {}
+    try:
+        while True:
+            request = Request(url.rstrip("/") + "/api/mission/logs",
+                              headers={"Authorization": "Bearer " + token})
+            try:
+                with urlopen(request, timeout=12.0) as response:
+                    document = json.load(response)
+                summary = {key: document.get(key) for key in
+                           ("mission_id", "state", "phase", "error", "navigation_failure_reason")}
+                if summary != previous:
+                    print(json.dumps(summary, ensure_ascii=False), flush=True)
+                    previous = summary
+                for event in document.get("navigation_events", []):
+                    stamp = event.get("monotonic_s")
+                    key = document.get("navigation_run")
+                    if isinstance(stamp, (int, float)) and stamp > latest.get(key, -1):
+                        print(json.dumps({name: event[name] for name in
+                                          ("event", "phase", "reason", "detail", "waypoint_id",
+                                           "monotonic_s", "wall_time_s") if name in event},
+                                         ensure_ascii=False), flush=True)
+                        latest[key] = stamp
+                if document.get("navigation_error"):
+                    print(document["navigation_error"], file=sys.stderr, flush=True)
+            except (OSError, ValueError) as error:
+                print("log read: " + str(error), file=sys.stderr, flush=True)
+            time.sleep(2.0)
+    except KeyboardInterrupt:
+        return 0
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIRECTORY)
@@ -257,7 +297,7 @@ def _parser() -> argparse.ArgumentParser:
     serve.add_argument("--map-session", type=Path)
     serve.add_argument("--allow-origin", help="one exact browser Origin allowed by CORS")
 
-    for name in ("start", "status", "stop"):
+    for name in ("start", "status", "logs", "watch", "stop"):
         command = subparsers.add_parser(name, help=f"call the local API {name} endpoint")
         command.add_argument("--url", default="http://127.0.0.1:8771")
         if name == "start":
@@ -270,6 +310,8 @@ def main() -> int:
     state_directory = arguments.state_dir.expanduser().resolve()
     token_path = (arguments.token_file or state_directory / "api-token").expanduser().resolve()
     token = _read_or_create_token(token_path)
+    if arguments.command == "watch":
+        return _watch_logs(arguments.url, token)
     if arguments.command != "serve":
         return _client_request(
             arguments.url, token, arguments.command, getattr(arguments, "request_id", None)

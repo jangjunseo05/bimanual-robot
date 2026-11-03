@@ -21,6 +21,7 @@ const START_HINT = {
   no_accepted_order: "수락한 주문이 없습니다",
   manipulation_not_ready: "조작 실행기가 준비되지 않았습니다",
   drive_init_running: "주행 초기화 중입니다",
+  drive_init_failed: "주행 초기화에 실패했습니다. 초기화 결과를 확인해 주세요",
   drive_not_connected: "주행 PC가 연결되지 않았습니다",
 };
 const DRINKS = { COLD_WATER: "냉수", HOT_WATER: "온수", LEMONADE: "레몬에이드", COLA: "콜라" };

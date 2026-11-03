@@ -29,6 +29,7 @@ DEFAULT_GEOMETRY = (
     / 'jdamr_cube_description/config/new_base_geometry.yaml')
 TARGET_GAP_M = 0.01
 LATERAL_TOLERANCE_M = 0.005
+ALLOWED_LATERAL_TOLERANCES_M = (LATERAL_TOLERANCE_M, 0.01)
 APPROACH_OFFSET_M = 0.5
 TABLE_ID_PATTERN = re.compile(r'table_\d+')
 
@@ -321,9 +322,10 @@ def prepare_map_session(pointer_path=DEFAULT_POINTER, output_dir=None,
     dock_scan = _dock_scan_evidence(
         pointer, pointer_path, source_map, home, home_path, home_xyz)
     water_station = station_records[0][2]
-    if not math.isclose(float(water_station.get('lateral_tolerance_m', math.nan)),
-                        LATERAL_TOLERANCE_M, abs_tol=1e-9):
-        raise ValueError('water_station lateral tolerance must be 0.005 m')
+    if not any(math.isclose(float(water_station.get('lateral_tolerance_m', math.nan)),
+                            allowed, abs_tol=1e-9)
+               for allowed in ALLOWED_LATERAL_TOLERANCES_M):
+        raise ValueError('water_station lateral tolerance must be 0.005 or 0.01 m')
 
     runtime = (Path(output_dir).expanduser().resolve()
                if output_dir is not None else source_dir / 'runtime')
@@ -378,7 +380,7 @@ def prepare_map_session(pointer_path=DEFAULT_POINTER, output_dir=None,
             target_front_gap_m=TARGET_GAP_M)
         station_pose['teaching']['captured_at'] = station.get('captured_at')
         station_pose.update({
-            'lateral_tolerance_m': LATERAL_TOLERANCE_M,
+            'lateral_tolerance_m': station.get('lateral_tolerance_m', LATERAL_TOLERANCE_M),
             'lateral_precision_status': 'NOT_VALIDATED',
             'target_gap_status': 'NOT_VALIDATED',
             'source': station.get('source'),
@@ -454,7 +456,7 @@ def prepare_map_session(pointer_path=DEFAULT_POINTER, output_dir=None,
             'object_reference_role': station.get('object_reference_role'),
             'target_front_gap_m': TARGET_GAP_M,
             'target_gap_status': 'NOT_VALIDATED',
-            'lateral_tolerance_m': LATERAL_TOLERANCE_M,
+            'lateral_tolerance_m': station.get('lateral_tolerance_m', LATERAL_TOLERANCE_M),
             'lateral_precision_status': 'NOT_VALIDATED',
             'approach_offset_m': APPROACH_OFFSET_M,
             'approach_offset_role': 'route_observation_only_not_final_parking_gap',

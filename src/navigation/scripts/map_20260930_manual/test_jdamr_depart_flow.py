@@ -1627,6 +1627,10 @@ def test_manual_recovery_does_not_require_display_or_recording(env, monkeypatch,
      'rear box target changed'),
     ([{'event': 'failed', 'reason': 'rear box observation deadline exceeded'}],
      'rear box observation deadline exceeded'),
+    ([{'event': 'straight_drive_stopped', 'reason': 'table approach depth stale or future-dated'},
+      {'event': 'trim_rotation_stopped', 'reason': 'rotation scan stale or future-dated'},
+      {'event': 'executor_failed', 'reason': 'executor_exit_nonzero'}],
+     'rotation scan stale or future-dated'),
     ([{'event': 'straight_drive_stopped', 'reason': 'rear box coarse handoff ready'}], None),
     ([{'event': 'precision_straight_finished', 'target_failure': None}], None),
 ])
@@ -1644,6 +1648,21 @@ def _dock_scan_pair(monkeypatch, *, delta=(.03, -.02, .04), shape='room'):
     anchored = np.column_stack((radii * np.cos(angles), radii * np.sin(angles)))
     if shape == 'line':
         anchored = np.column_stack((np.linspace(-2., 2., 120), np.ones(120)))
+    if shape == 'two_sector_unique':
+        angles = np.concatenate((rng.uniform(.2, 1.35, 60),
+                                 rng.uniform(1.8, 2.9, 60)))
+        radii = rng.uniform(.5, 4., len(angles))
+        anchored = np.column_stack((radii * np.cos(angles), radii * np.sin(angles)))
+    if shape == 'one_sector_unique':
+        angles = rng.uniform(.2, 1.35, 120)
+        radii = rng.uniform(.5, 4., len(angles))
+        anchored = np.column_stack((radii * np.cos(angles), radii * np.sin(angles)))
+    if shape == 'two_sector_translation_ambiguous':
+        angles = np.concatenate((rng.uniform(.2, 1.35, 60),
+                                 rng.uniform(1.8, 2.9, 60)))
+        radii = rng.uniform(.5, 4., len(angles))
+        base = np.column_stack((radii * np.cos(angles), radii * np.sin(angles)))
+        anchored = np.concatenate((base, base + np.array([.06, 0.])))
     c, s = math.cos(delta[2]), math.sin(delta[2])
     current = (anchored - delta[:2]) @ np.array([[c, -s], [s, c]])
     if shape == 'clutter':
@@ -1697,6 +1716,33 @@ def test_registered_dock_accepts_changed_visibility_with_enough_matched_support(
     assert min(result['inlier_5cm'], result['reference_inlier_5cm']) < .70
     assert min(result['current_inlier_count'], result['reference_inlier_count']) >= 80
     assert result['relative_pose'] == pytest.approx((.03, -.02, .04), abs=.006)
+
+
+@pytest.mark.parametrize(('shape', 'expected_sectors'),
+                         [('one_sector_unique', 1), ('two_sector_unique', 2)])
+def test_registered_dock_accepts_unique_fixed_support_regardless_of_sector_bins(
+        monkeypatch, shape, expected_sectors):
+    diagnostics = {}
+    click, reference = _dock_scan_pair(monkeypatch, shape=shape)
+    result = d.refine_at_registered_dock(
+        'current', click, reference, diagnostics=diagnostics)
+    assert result is not None
+    assert diagnostics['supported_sectors'] == expected_sectors
+    assert diagnostics['ambiguous_translation_trials'] == []
+    assert len(diagnostics['uniqueness_trials']) == 6
+
+
+def test_registered_dock_rejects_two_sector_translation_ambiguity(monkeypatch):
+    diagnostics = {}
+    click, reference = _dock_scan_pair(
+        monkeypatch, shape='two_sector_translation_ambiguous')
+    result = d.refine_at_registered_dock(
+        'current', click, reference, diagnostics=diagnostics)
+    assert result is None
+    assert diagnostics['reason'] == 'dock_match_limited_angular_support_not_unique'
+    assert diagnostics['supported_sectors'] == 2
+    assert diagnostics['ambiguous_translation_trials']
+    assert len(diagnostics['uniqueness_trials']) == 6
 
 
 @pytest.mark.parametrize('case', ['click', 'previous_seed', 'new_map', 'new_home',

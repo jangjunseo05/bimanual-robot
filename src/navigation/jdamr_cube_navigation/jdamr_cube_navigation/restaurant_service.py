@@ -372,6 +372,7 @@ class ServiceRoute(CorridorRoute):
                 OccupancyGrid, topic,
                 lambda message, name=key: self._map_callback(name, message), AMCL_QOS)
         self.run_deadline_s = None
+        self._input_recovery_paused = False
         self.create_timer(0.1, self._deadline_tick)
 
     def _box_callback(self, message):
@@ -389,7 +390,9 @@ class ServiceRoute(CorridorRoute):
         self.box_status_received_s = time.monotonic()
 
     def _deadline_tick(self):
-        if self.run_deadline_s is not None and time.monotonic() >= self.run_deadline_s:
+        if (self.run_deadline_s is not None
+                and not getattr(self, '_input_recovery_paused', False)
+                and time.monotonic() >= self.run_deadline_s):
             self.request_stop()
 
     def _amcl_callback(self, message):
@@ -901,28 +904,90 @@ class ServiceRoute(CorridorRoute):
         keyframes = [(pose, frame) for stamp_s, pose, frame
                      in getattr(self, 'scan_memory', None) or ()
                      if now_s - stamp_s <= SCAN_MEMORY_MAX_AGE_S]
+        cleared_sources = getattr(self, '_blind_point_clearances', None)
+        if cleared_sources is None:
+            cleared_sources = self._blind_point_clearances = set()
+        clearance_failures = getattr(self, '_blind_point_clearance_failures', None)
+        if clearance_failures is None:
+            clearance_failures = self._blind_point_clearance_failures = {}
         self._blind_point_sources = []
+        self._blind_point_diagnostics = []
         if not keyframes:
+            cleared_sources.clear()
+            clearance_failures.clear()
             return []
         current_pose = self._odom_pose()
+        current_scan_pose = None
+        current_evidence_failure = None
+        try:
+            stamp_s = scan.header.stamp.sec + scan.header.stamp.nanosec * 1e-9
+            ros_now_s = self.get_clock().now().nanoseconds * 1e-9
+            if not 0.0 <= ros_now_s - stamp_s <= ESCAPE_SCAN_MAX_AGE_S:
+                current_evidence_failure = 'current_scan_timestamp_not_fresh'
+                raise ValueError(current_evidence_failure)
+            base = self.parking_contract['robot_base_frame']
+            scan_transform = self.parking_tf.lookup_transform(
+                'odom', base, rclpy.time.Time(seconds=stamp_s)).transform
+            current_scan_pose = (
+                scan_transform.translation.x, scan_transform.translation.y,
+                _quaternion_yaw(scan_transform.rotation))
+        except TransformException:
+            current_evidence_failure = 'current_scan_stamped_tf_unavailable'
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            # A missing stamped pose can never establish clearance. Existing
+            # memory still uses the current pose and remains fail-closed.
+            current_evidence_failure = (
+                current_evidence_failure or 'current_scan_timestamp_invalid')
         return remembered_blind_points(
             keyframes, current_pose, laser, scan.range_min,
-            source_point_filter=source_point_filter, source_records=self._blind_point_sources)
+            source_point_filter=source_point_filter, source_records=self._blind_point_sources,
+            current_scan=scan, current_scan_pose=current_scan_pose,
+            cleared_sources=cleared_sources, clearance_failures=clearance_failures,
+            source_diagnostics=self._blind_point_diagnostics,
+            current_evidence_failure=current_evidence_failure)
 
     def _remember_scan(self, scan):
         """Keep a scan whenever the base moved SCAN_MEMORY_STEP_M or turned STEP_RAD."""
         memory = getattr(self, 'scan_memory', None)
-        pose = getattr(self, 'odom_last_pose', None)
-        if memory is None or pose is None:
+        latest_pose = getattr(self, 'odom_last_pose', None)
+        if memory is None or latest_pose is None:
             return
-        if memory and math.dist(pose[:2], memory[-1][1][:2]) > SCAN_MEMORY_RESET_M:
+        if memory and math.dist(latest_pose[:2], memory[-1][1][:2]) > SCAN_MEMORY_RESET_M:
             memory.clear()
         if memory:
             _stamp_s, last, _scan = memory[-1]
-            turned = abs(math.atan2(math.sin(pose[2] - last[2]), math.cos(pose[2] - last[2])))
-            if (math.dist(pose[:2], last[:2]) < SCAN_MEMORY_STEP_M
+            turned = abs(math.atan2(
+                math.sin(latest_pose[2] - last[2]),
+                math.cos(latest_pose[2] - last[2])))
+            if (math.dist(latest_pose[:2], last[:2]) < SCAN_MEMORY_STEP_M
                     and turned < SCAN_MEMORY_STEP_RAD):
                 return
+        pose = latest_pose
+        try:
+            header = scan.header
+        except AttributeError:
+            # Headerless test/custom scans cannot establish persistent clearance.
+            header = None
+        if header is not None:
+            try:
+                stamp_s = float(header.stamp.sec) + float(header.stamp.nanosec) * 1e-9
+                if not math.isfinite(stamp_s):
+                    return
+                transform = self.parking_tf.lookup_transform(
+                    'odom', self.parking_contract['robot_base_frame'],
+                    rclpy.time.Time(seconds=stamp_s)).transform
+            except (AttributeError, TypeError, ValueError, OverflowError,
+                    TransformException):
+                return
+            pose = (transform.translation.x, transform.translation.y,
+                    _quaternion_yaw(transform.rotation))
+            if memory:
+                _stored_s, last, _stored_scan = memory[-1]
+                turned = abs(math.atan2(
+                    math.sin(pose[2] - last[2]), math.cos(pose[2] - last[2])))
+                if (math.dist(pose[:2], last[:2]) < SCAN_MEMORY_STEP_M
+                        and turned < SCAN_MEMORY_STEP_RAD):
+                    return
         memory.append((time.monotonic(), pose, scan))
 
     def _blocked_ahead(self, band_m=PATH_BLOCKED_AHEAD_BAND_M, found=None):
@@ -1199,7 +1264,7 @@ class ServiceRoute(CorridorRoute):
         return publisher
 
     def _direct_motion(self, command, done, measure, deadline_s, event, watch=None,
-                       confirm_stopped=False):
+                       confirm_stopped=False, pause_on_failure=None):
         """
         Publish command until done(measure()) or a stop, then stop and let the base settle.
 
@@ -1213,6 +1278,14 @@ class ServiceRoute(CorridorRoute):
         setup_started_s = time.monotonic()
         publisher = self._escape_publisher()
         self._last_direct_motion_failure = None
+        previous_pause = getattr(self, '_input_recovery_paused', False)
+        # Publisher discovery may have blocked callbacks before the first
+        # measurement. Drain pending inputs before judging their freshness.
+        input_deadline_s = time.monotonic() + 0.02
+        for _ in range(32):
+            if self.stop_requested or time.monotonic() >= input_deadline_s:
+                break
+            spin_node(self, timeout_sec=0.0)
         value = measure()
         # DDS publisher creation precedes motion and can exceed a short move's
         # budget. Keep that budget for motion; the task deadline stays fixed.
@@ -1224,47 +1297,92 @@ class ServiceRoute(CorridorRoute):
         if setup_s >= 0.1:
             self.emit('direct_motion_ready', setup_s=setup_s,
                       motion_budget_s=max(0.0, deadline_s - time.monotonic()))
-        published_s = guarded_s = 0.0
+        published_s, guarded_s = 0.0, -math.inf
         # The velocity smoother ramps to zero after velocity_timeout (0.5 s) without
         # a command, so a gap that long is a stop no event reports.
         max_publish_gap_s = 0.0
+        settle_pause_started_s = None
+        input_recovered = False
+
+        def finish_settle_pause():
+            nonlocal settle_pause_started_s
+            if settle_pause_started_s is None:
+                return
+            settle_pause_s = max(0.0, time.monotonic() - settle_pause_started_s)
+            task_deadline_s = getattr(self, 'run_deadline_s', None)
+            if (isinstance(task_deadline_s, (int, float))
+                    and not isinstance(task_deadline_s, bool)
+                    and math.isfinite(task_deadline_s)):
+                self.run_deadline_s = task_deadline_s + settle_pause_s
+            self._input_recovery_paused = previous_pause
+            settle_pause_started_s = None
+
         try:
-            while not done(value) and not self.stop_requested and time.monotonic() < deadline_s:
-                now_s = time.monotonic()
-                if now_s - guarded_s >= DIRECT_GUARD_PERIOD_S:
-                    guarded_s = now_s
-                    failure = (self._guard_failure(False)
-                               or (None if self._operator_link_ready() else 'operator_link_lost')
-                               or (watch() if watch else None))
-                    if failure:
-                        self._last_direct_motion_failure = failure
-                        self.emit(event, reason=failure, max_publish_gap_s=max_publish_gap_s)
-                        break
-                if now_s - published_s >= 0.05:
-                    if published_s:
-                        max_publish_gap_s = max(max_publish_gap_s, now_s - published_s)
-                    publisher.publish(command)
-                    published_s = time.monotonic()
-                # Drain inputs over this control interval before running the
-                # geometry again; one callback per measurement can leave TF,
-                # depth and odometry queued behind expensive path previews.
-                input_deadline_s = time.monotonic() + 0.02
-                while not self.stop_requested:
-                    input_remaining_s = input_deadline_s - time.monotonic()
-                    if input_remaining_s <= 0.0:
-                        break
-                    spin_node(self, timeout_sec=min(0.002, input_remaining_s))
-                value = measure()
-            if self.stop_requested:
-                self._last_direct_motion_failure = 'operator_stop'
-            elif time.monotonic() >= deadline_s and not done(value):
-                self._last_direct_motion_failure = 'direct_motion_timeout'
-                self.emit(event, reason='direct_motion_timeout',
-                          max_publish_gap_s=max_publish_gap_s)
-        finally:
-            for _repeat in range(5):
-                publisher.publish(Twist())
-                spin_node(self, timeout_sec=0.02)
+            try:
+                while (not done(value) and not self.stop_requested
+                       and time.monotonic() < deadline_s):
+                    now_s = time.monotonic()
+                    if now_s - guarded_s >= DIRECT_GUARD_PERIOD_S:
+                        guarded_s = now_s
+                        failure = (self._guard_failure(False)
+                                   or (None if self._operator_link_ready()
+                                       else 'operator_link_lost')
+                                   or (watch() if watch else None))
+                        if failure:
+                            if (not input_recovered and self._input_gap_recoverable(failure)
+                                    and self._operator_link_ready()
+                                    and not self.stop_requested):
+                                publisher.publish(Twist())
+                                paused_s = time.monotonic()
+                                if self._wait_for_input_recovery(failure):
+                                    pause_s = time.monotonic() - paused_s
+                                    deadline_s += pause_s
+                                    if getattr(self, 'run_deadline_s', None) is not None:
+                                        self.run_deadline_s += pause_s
+                                    input_recovered = True
+                                    self.emit('direct_motion_input_recovered', reason=failure,
+                                              paused_s=pause_s, target_preserved=True)
+                                    value = measure()
+                                    continue
+                            if (pause_on_failure is not None and pause_on_failure(failure)
+                                    and not getattr(self, '_input_recovery_paused', False)):
+                                settle_pause_started_s = time.monotonic()
+                                self._input_recovery_paused = True
+                            self._last_direct_motion_failure = failure
+                            self.emit(event, reason=failure,
+                                      max_publish_gap_s=max_publish_gap_s)
+                            break
+                    if now_s - published_s >= 0.05:
+                        if published_s:
+                            max_publish_gap_s = max(max_publish_gap_s, now_s - published_s)
+                        publisher.publish(command)
+                        published_s = time.monotonic()
+                    # Drain inputs over this control interval before running the
+                    # geometry again; one callback per measurement can leave TF,
+                    # depth and odometry queued behind expensive path previews.
+                    input_deadline_s = time.monotonic() + 0.02
+                    while not self.stop_requested:
+                        input_remaining_s = input_deadline_s - time.monotonic()
+                        if input_remaining_s <= 0.0:
+                            break
+                        spin_node(self, timeout_sec=min(0.002, input_remaining_s))
+                    value = measure()
+                if self.stop_requested:
+                    self._last_direct_motion_failure = 'operator_stop'
+                elif (time.monotonic() >= deadline_s and not done(value)
+                        and not getattr(self, '_input_recovery_paused', False)):
+                    self._last_direct_motion_failure = 'direct_motion_timeout'
+                    self.emit(event, reason='direct_motion_timeout',
+                              max_publish_gap_s=max_publish_gap_s)
+            finally:
+                for _repeat in range(5):
+                    publisher.publish(Twist())
+                    spin_node(self, timeout_sec=0.02)
+        except BaseException:
+            finish_settle_pause()
+            if not previous_pause:
+                self._input_recovery_paused = False
+            raise
         stopped_s = time.monotonic()
         stationary_since_s = None
         stationary_samples = 0
@@ -1283,35 +1401,38 @@ class ServiceRoute(CorridorRoute):
         # below-threshold sample arrived at the end of the settle window.
         settle_deadline_s = (stopped_s + DIRECT_SETTLE_S
                              + (DIRECT_STOP_DECEL_GRACE_S if confirm_stopped else 0.0))
-        while time.monotonic() < settle_deadline_s:
-            now_s = time.monotonic()
-            if now_s - zero_published_s >= 0.05:
-                publisher.publish(Twist())
-                zero_published_s = now_s
-            motion = getattr(self, 'latest_motion', None)
-            fresh_sample = (motion is not None and motion[0] > stopped_s
-                            and motion[0] != last_motion_stamp_s)
-            if fresh_sample:
-                last_motion_stamp_s = motion[0]
-                fresh_motion_samples += 1
-            if (motion is not None and motion[0] > stopped_s
-                    and abs(motion[1]) <= stopped_linear_mps
-                    and abs(motion[2]) <= stopped_angular_radps):
-                if not confirm_stopped:
-                    stopped_confirmed = True
-                    break
-                if stationary_since_s is None:
-                    stationary_since_s = motion[0]
+        try:
+            while time.monotonic() < settle_deadline_s:
+                now_s = time.monotonic()
+                if now_s - zero_published_s >= 0.05:
+                    publisher.publish(Twist())
+                    zero_published_s = now_s
+                motion = getattr(self, 'latest_motion', None)
+                fresh_sample = (motion is not None and motion[0] > stopped_s
+                                and motion[0] != last_motion_stamp_s)
                 if fresh_sample:
-                    stationary_samples += 1
-                if (stationary_samples >= DIRECT_STOP_CONFIRM_SAMPLES
-                        or motion[0] - stationary_since_s >= DIRECT_STOP_CONFIRM_S):
-                    stopped_confirmed = True
-                    break
-            elif fresh_sample:
-                stationary_since_s = None
-                stationary_samples = 0
-            spin_node(self, timeout_sec=0.02)
+                    last_motion_stamp_s = motion[0]
+                    fresh_motion_samples += 1
+                if (motion is not None and motion[0] > stopped_s
+                        and abs(motion[1]) <= stopped_linear_mps
+                        and abs(motion[2]) <= stopped_angular_radps):
+                    if not confirm_stopped:
+                        stopped_confirmed = True
+                        break
+                    if stationary_since_s is None:
+                        stationary_since_s = motion[0]
+                    if fresh_sample:
+                        stationary_samples += 1
+                    if (stationary_samples >= DIRECT_STOP_CONFIRM_SAMPLES
+                            or motion[0] - stationary_since_s >= DIRECT_STOP_CONFIRM_S):
+                        stopped_confirmed = True
+                        break
+                elif fresh_sample:
+                    stationary_since_s = None
+                    stationary_samples = 0
+                spin_node(self, timeout_sec=0.02)
+        finally:
+            finish_settle_pause()
         if not stopped_confirmed:
             self._last_direct_motion_failure = 'odometry did not confirm stop'
             motion = getattr(self, 'latest_motion', None)
@@ -1327,7 +1448,7 @@ class ServiceRoute(CorridorRoute):
             return None
         return measure()
 
-    def _rotate_in_place(self, delta_rad):
+    def _rotate_in_place(self, delta_rad, *, pause_on_failure=None):
         """
         Turn without translation, reducing the rate for small corrections.
 
@@ -1385,12 +1506,28 @@ class ServiceRoute(CorridorRoute):
         deadline_s = time.monotonic() + abs(delta_rad) / speed_radps + TRIM_EXTRA_S
         turned_rad = self._direct_motion(
             command, lambda turned: abs(turned) >= abs(delta_rad) - early_rad, measure,
-            deadline_s, 'trim_rotation_stopped', watch=lambda: collision_watch(command))
+            deadline_s, 'trim_rotation_stopped', watch=lambda: collision_watch(command),
+            **({'pause_on_failure': pause_on_failure}
+               if pause_on_failure is not None else {}))
         return None if getattr(self, '_last_direct_motion_failure', None) else turned_rad
 
     def _drive_zero_turn(self, distance_m, watch=None, precision=False,
                          hold_heading=False, target_update=None, command_watch=None,
                          approach_time_s=None, continuous_table=False):
+        """Run one straight move and restore the caller's deadline-pause state."""
+        previous_pause = getattr(self, '_input_recovery_paused', False)
+        try:
+            return self._drive_zero_turn_impl(
+                distance_m, watch=watch, precision=precision,
+                hold_heading=hold_heading, target_update=target_update,
+                command_watch=command_watch, approach_time_s=approach_time_s,
+                continuous_table=continuous_table)
+        finally:
+            self._input_recovery_paused = previous_pause
+
+    def _drive_zero_turn_impl(self, distance_m, watch=None, precision=False,
+                              hold_heading=False, target_update=None, command_watch=None,
+                              approach_time_s=None, continuous_table=False):
         """
         Command (+-STRAIGHT_ESCAPE_SPEED_MPS, 0) until odom shows distance_m.
 
@@ -1404,6 +1541,7 @@ class ServiceRoute(CorridorRoute):
         It runs only between goals. Returns the signed travel along the start heading
         once the base is at rest, or None without odom.
         """
+        previous_pause = getattr(self, '_input_recovery_paused', False)
         if target_update is not None and not (precision and hold_heading and distance_m != 0.0):
             raise ValueError('live approach requires nonzero precision heading hold')
         if continuous_table and (target_update is None or distance_m <= 0.):
@@ -1515,6 +1653,10 @@ class ServiceRoute(CorridorRoute):
                         command.linear.x = direction * min(abs(command.linear.x), next_speed)
                 except (KeyError, TypeError, ValueError, RuntimeError) as error:
                     state['target_failure'] = str(error) or type(error).__name__
+                    if state['target_failure'] in recoverable_target_failures:
+                        if state.get('recovery_paused_s') is None:
+                            state['recovery_paused_s'] = time.monotonic()
+                        self._input_recovery_paused = True
                     state['resume_speed_mps'] = command.linear.x
                     command.linear.x = command.angular.z = 0.0
             if hold_heading and state['target_failure'] is None:
@@ -1631,16 +1773,17 @@ class ServiceRoute(CorridorRoute):
 
         def motion_watch():
             failure = state['tf_failure'] or state['target_failure']
-            if failure is not None:
-                return failure
-            if command_watch is not None:
+            if failure is None and command_watch is not None:
                 failure = command_watch(command)
                 if failure:
                     state['target_failure'] = failure
                     state['resume_speed_mps'] = command.linear.x
                     command.linear.x = command.angular.z = 0.0
-                    return failure
-            return watch() if watch else None
+            if failure in recoverable_target_failures:
+                if state.get('recovery_paused_s') is None:
+                    state['recovery_paused_s'] = time.monotonic()
+                self._input_recovery_paused = True
+            return failure if failure is not None else (watch() if watch else None)
 
         if target_update is not None:
             # Remaining-distance taper and fresh depth corrections share one move.
@@ -1656,6 +1799,7 @@ class ServiceRoute(CorridorRoute):
             'table approach depth stale or future-dated',
             'table approach observer latency',
             'table approach tape reference pending',
+            'table approach stable face unavailable',
         }
         recoverable_rear_failures = {
             'rear box scan unavailable', 'rear box scan stale or future-dated',
@@ -1687,60 +1831,73 @@ class ServiceRoute(CorridorRoute):
                 break
             reason = state['target_failure']
             resume_speed = state.get('resume_speed_mps', speed_mps)
-            paused_s = time.monotonic()
+            paused_s = state.pop('recovery_paused_s', None) or time.monotonic()
             rear_recovery = reason in recoverable_rear_failures
-            bounded_recovery = rear_recovery or reason == 'table approach tape reference pending'
-            recovery_deadline_s = (min(deadline_s, getattr(self, 'run_deadline_s', deadline_s))
-                                   if bounded_recovery else math.inf)
             event_prefix = 'rear_box' if rear_recovery else 'table_approach'
             self.emit(f'{event_prefix}_waiting_for_input', reason=reason,
                       travelled_m=state['travelled'], target_preserved=True)
             # A temporary depth gap pauses this same odom-frozen move. No goal,
             # nonzero velocity or changed stop point is sent while inputs are bad.
-            link_lost = False
-            while not self.stop_requested and time.monotonic() < recovery_deadline_s:
-                spin_node(self, timeout_sec=0.05)
-                if not link_lost and not self._operator_link_ready():
-                    link_lost = True
-                if link_lost or self._guard_failure(False):
-                    continue
-                state['target_failure'] = None
-                command.linear.x = resume_speed
-                measure()
-                if state['tf_failure'] is not None:
-                    break
-                if (rear_recovery and state['target_failure'] is None
-                        and reached_stop_point(state['travelled'])):
-                    # Arrival needs no new motion preview. Valid feedback and the
-                    # normal stopped-pose confirmation still precede success.
-                    command.linear.x = command.angular.z = 0.0
-                    self.emit('rear_box_input_recovered',
-                              paused_s=time.monotonic() - paused_s,
-                              travelled_m=state['travelled'], target_preserved=True,
-                              arrival_reached=True)
-                    break
-                if state['target_failure'] is None and command_watch is not None:
-                    state['target_failure'] = command_watch(command)
-                    if state['target_failure']:
+            self._input_recovery_paused = True
+            try:
+                while not self.stop_requested:
+                    self._escape_publisher().publish(Twist())
+                    spin_node(self, timeout_sec=0.05)
+                    if not self._operator_link_ready():
+                        state['target_failure'] = 'operator_link_lost'
+                        break
+                    guard_failure = self._guard_failure(False)
+                    if guard_failure:
+                        if self._input_gap_recoverable(guard_failure):
+                            continue
+                        state['target_failure'] = guard_failure
+                        break
+                    state['target_failure'] = None
+                    command.linear.x = resume_speed
+                    measure()
+                    if state['tf_failure'] is not None:
+                        break
+                    if (rear_recovery and state['target_failure'] is None
+                            and reached_stop_point(state['travelled'])):
+                        # Arrival needs no new motion preview. Valid feedback and the
+                        # normal stopped-pose confirmation still precede success.
                         command.linear.x = command.angular.z = 0.0
-                if state['target_failure'] is None:
-                    self.emit(f'{event_prefix}_input_recovered',
-                              paused_s=time.monotonic() - paused_s,
-                              travelled_m=state['travelled'], target_preserved=True)
-                    break
-                if state['target_failure'] not in recoverable_target_failures:
-                    break
-            if (rear_recovery and time.monotonic() >= recovery_deadline_s
-                    and not self.stop_requested):
-                state['target_failure'] = 'rear box input recovery deadline exceeded'
+                        self.emit('rear_box_input_recovered',
+                                  paused_s=time.monotonic() - paused_s,
+                                  travelled_m=state['travelled'], target_preserved=True,
+                                  arrival_reached=True)
+                        break
+                    if state['target_failure'] is None and command_watch is not None:
+                        state['target_failure'] = command_watch(command)
+                        if state['target_failure']:
+                            command.linear.x = command.angular.z = 0.0
+                    if state['target_failure'] is None:
+                        self.emit(f'{event_prefix}_input_recovered',
+                                  paused_s=time.monotonic() - paused_s,
+                                  travelled_m=state['travelled'], target_preserved=True)
+                        break
+                    if state['target_failure'] not in recoverable_target_failures:
+                        break
+            finally:
+                # measure() may see further gaps while already waiting. They
+                # belong to this pause, not to the next recovery interval.
+                state.pop('recovery_paused_s', None)
+                self._input_recovery_paused = previous_pause
             if self.stop_requested or state['tf_failure'] or state['target_failure']:
                 command.linear.x = command.angular.z = 0.0
                 break
-            if not bounded_recovery:
-                deadline_s += time.monotonic() - paused_s
+            paused_duration_s = time.monotonic() - paused_s
+            deadline_s += paused_duration_s
+            if getattr(self, 'run_deadline_s', None) is not None:
+                self.run_deadline_s += paused_duration_s
+            if state['target_reached']:
+                travelled_m = state['travelled']
+                break
             timing['checked_s'] = None
         # Recovery can discover a different terminal failure without entering
         # _direct_motion again. Propagate that cause instead of the old pause.
+        if state.get('recovery_paused_s') is not None:
+            self._input_recovery_paused = previous_pause
         if not self.stop_requested:
             failure = state['tf_failure'] or state['target_failure']
             if failure:
@@ -2050,8 +2207,10 @@ class ServiceRoute(CorridorRoute):
                         # Stay stopped while callbacks refresh the snapshot; never
                         # extend the age accepted by _scan_in_base.
                         self.emit(f'{motion}_release_waiting_scan')
-                        deadline = min(self.run_deadline_s,
-                                       time.monotonic() + ESCAPE_SCAN_MAX_AGE_S)
+                        deadline = time.monotonic() + ESCAPE_SCAN_MAX_AGE_S
+                        task_deadline_s = getattr(self, 'run_deadline_s', None)
+                        if task_deadline_s is not None:
+                            deadline = min(task_deadline_s, deadline)
                         while (found is None and not self.stop_requested
                                and time.monotonic() < deadline):
                             spin_node(self, timeout_sec=0.02)
@@ -2778,7 +2937,7 @@ class ServiceRoute(CorridorRoute):
                                'the home contract')
         return 'alignment_goal_checker'
 
-    def _reach_staging(self, stage):
+    def _reach_staging(self, stage, *, pause_on_rotation_failure=None):
         """
         Reach the staging position, then turn in place toward the dock heading.
 
@@ -2803,7 +2962,8 @@ class ServiceRoute(CorridorRoute):
                          else STAGING_CORRECTION_MIN_RAD)
             if abs(delta_rad) <= limit_rad:
                 return actual
-            turned = self._rotate_in_place(delta_rad)
+            turned = self._rotate_in_place(
+                delta_rad, pause_on_failure=pause_on_rotation_failure)
             self.emit('staging_turn_observed', requested_yaw_rad=delta_rad,
                       observed_yaw_rad=turned, observation_frame='odom', controller='damped')
             if turned is None:

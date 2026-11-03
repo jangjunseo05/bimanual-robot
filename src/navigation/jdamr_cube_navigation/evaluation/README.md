@@ -4,6 +4,8 @@
 
 ## 구성
 
+- [급수대 깊이 입력 지연 트러블슈팅](20261103_DEPTH_LATENCY_TROUBLESHOOTING.md):
+  주문 261103002의 대기·재개와 계산 지연, Wi-Fi 혼잡 가설, 원인 분리에 필요한 기존 진단 필드
 - [고정 사선 카메라 관제 메인 영상](media/gazebo_fixed_dashboard_20260909/README.md):
   실제 문에서의 횡단, 금지 구역·박스 우회, 동일 목표 재개 PASS와 동기화된 화이트 관제
 - [고정 카메라 재촬영 인계](20260909_FIXED_CAMERA_HANDOFF.md):

@@ -126,6 +126,9 @@ def filter_station_goal_observations(observations, max_age_s):
     result['goal_filter_xy_spread_m'] = max(
         math.dist(sample['goal_odom'][:2], result['goal_odom'][:2])
         for sample in samples)
+    result['goal_filter_yaw_spread_rad'] = max(
+        abs(_wrapped(sample['goal_odom'][2] - result['goal_odom'][2]))
+        for sample in samples)
     return result
 
 
@@ -377,7 +380,7 @@ class TaughtStationReference:
         self.run_left_offset_m = offset
 
     def observe(self, current_rgb, current_info, odom_pose_at_image_stamp,
-                stamp_s):
+                stamp_s, *, surface=None):
         """Return the bound goal (capture pose plus lateral offset) in odom."""
         try:
             stamp = _finite(stamp_s, 'stamp_s')
@@ -390,7 +393,11 @@ class TaughtStationReference:
                 'current_camera_intrinsics_identity_mismatch', stamp,
                 self.assumptions)
         if self.contact_reference is not None:
-            error, quality = self.contact_reference.observe(current_rgb)
+            if self.observation_method == 'table_front_tape' and surface is not None:
+                error, quality = self.contact_reference.observe(
+                    current_rgb, surface=surface, rgb_info=current_info)
+            else:
+                error, quality = self.contact_reference.observe(current_rgb)
         else:
             estimate = self.prepared_reference.observe(current_rgb, current_info)
             quality = {

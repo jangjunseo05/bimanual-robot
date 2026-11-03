@@ -226,6 +226,7 @@ def dock_departure_route():
 def dock_departure_static_corridor(monkeypatch):
     checker = Mock(return_value=True)
     monkeypatch.setattr(restaurant_service, 'static_corridor_clear', checker)
+    monkeypatch.setattr(restaurant_service, 'spin_node', lambda *_a, **_k: None)
     return checker
 
 
@@ -3895,6 +3896,8 @@ def test_filtered_blind_memory_uses_one_current_pose_snapshot(monkeypatch):
     assert source_scan is scan
     assert point == pytest.approx((.39, 0.))
     assert current == (.20, 0., 0.)
+    assert node._blind_point_diagnostics[0]['reason'] == (
+        'current_scan_timestamp_invalid')
 
 
 def test_escape_snapshot_needs_a_fresh_scan_and_carries_the_blind_memory(monkeypatch):
@@ -3925,6 +3928,33 @@ def test_scan_memory_keeps_one_scan_per_5_cm_or_10_deg():
         node._remember_scan('scan')
     assert [frame[1] for frame in node.scan_memory] == [
         (0.0, 0.0, 0.0), (0.05, 0.0, 0.0), (0.05, 0.0, 0.2)]
+
+
+def test_scan_memory_stores_pose_at_scan_stamp_and_fails_closed_without_it():
+    from collections import deque
+    node = route()
+    node.scan_memory = deque(maxlen=restaurant_service.SCAN_MEMORY_KEYFRAMES)
+    node.odom_last_pose = (9., 9., 1.)
+    node.parking_contract = {'robot_base_frame': 'base_link'}
+    scan = SimpleNamespace(header=SimpleNamespace(
+        stamp=SimpleNamespace(sec=12, nanosec=250_000_000)))
+    yaw = .3
+    transform = SimpleNamespace(transform=SimpleNamespace(
+        translation=SimpleNamespace(x=1., y=2.),
+        rotation=SimpleNamespace(x=0., y=0., z=math.sin(yaw / 2.),
+                                 w=math.cos(yaw / 2.))))
+    node.parking_tf = SimpleNamespace(lookup_transform=Mock(return_value=transform))
+
+    node._remember_scan(scan)
+
+    assert node.scan_memory[0][1] == pytest.approx((1., 2., yaw))
+    node.scan_memory.clear()
+    node.parking_tf.lookup_transform.side_effect = [
+        TransformException('missing'), transform]
+    node._remember_scan(scan)
+    assert not node.scan_memory
+    node._remember_scan(scan)
+    assert node.scan_memory[0][1] == pytest.approx((1., 2., yaw))
 
 
 def test_something_in_the_front_blind_range_backs_off_instead_of_driving_forward():
@@ -4344,9 +4374,7 @@ def test_live_depth_gap_waits_stopped_and_resumes_same_target(monkeypatch, inter
 @pytest.mark.parametrize('failure', [
     'rear box face unavailable', 'rear box target changed',
     'rear docking swept footprint occupied', 'table approach tape reference pending'])
-@pytest.mark.parametrize('recovers', [True, False])
-def test_rear_input_gap_keeps_same_motion_and_respects_task_deadline(
-        monkeypatch, failure, recovers):
+def test_rear_input_gap_pauses_task_deadline_and_resumes_same_motion(monkeypatch, failure):
     node = route()
     clock, position, velocity = [10.0], [0.0], [0.0]
     commands = []
@@ -4360,8 +4388,9 @@ def test_rear_input_gap_keeps_same_motion_and_respects_task_deadline(
         clock[0] += .02
         position[0] += velocity[0] * .02
         node.latest_motion = (clock[0], velocity[0], 0.0)
+        node._deadline_tick()
     def update(actual):
-        if actual[0] > .01 and (not recovers or clock[0] < 11.5):
+        if actual[0] > .01 and clock[0] < 15.5:
             raise RuntimeError(failure)
         return {'remaining_m': .04 - actual[0]}
     node.escape_velocity = SimpleNamespace(publish=publish)
@@ -4375,15 +4404,126 @@ def test_rear_input_gap_keeps_same_motion_and_respects_task_deadline(
     prefix = 'table_approach' if failure.startswith('table ') else 'rear_box'
     waiting = next(e for e in _events(node) if e['event'] == f'{prefix}_waiting_for_input')
     assert waiting['target_preserved']
-    assert all(v == 0. for t, v in commands if waiting['monotonic_s'] <= t < 11.5)
-    assert clock[0] < 14.6
-    if recovers:
-        assert result == pytest.approx(.04, abs=.003)
-        assert any(e['event'] == f'{prefix}_input_recovered' for e in _events(node))
-    else:
-        assert result is None
-        assert position[0] < .02
-        assert not any(e['event'] == f'{prefix}_input_recovered' for e in _events(node))
+    assert all(v == 0. for t, v in commands if waiting['monotonic_s'] <= t < 15.5)
+    assert result == pytest.approx(.04, abs=.003)
+    assert clock[0] > 14.0
+    assert node.run_deadline_s > 18.0
+    assert any(e['event'] == f'{prefix}_input_recovered' for e in _events(node))
+
+
+@pytest.mark.parametrize('previous_pause', [False, True])
+def test_rear_input_gap_pauses_deadline_before_stop_confirmation(
+        monkeypatch, previous_pause):
+    node = route()
+    clock, position, velocity = [10.0], [0.0], [0.0]
+    commands = []
+    node.run_deadline_s = 10.16
+    node._input_recovery_paused = previous_pause
+    node._operator_link_ready = lambda: True
+    node.latest_motion = (clock[0], 0.0, 0.0)
+
+    def publish(message):
+        velocity[0] = message.linear.x
+        commands.append((clock[0], message.linear.x))
+
+    def spin(*_a, **_k):
+        clock[0] += .02
+        position[0] += velocity[0] * .02
+        node.latest_motion = (clock[0], velocity[0], 0.0)
+        node._deadline_tick()
+
+    def update(actual):
+        if actual[0] > .006:
+            if clock[0] < 10.5:
+                raise RuntimeError('rear box face unavailable')
+            return {'remaining_m': 0.0, 'target_confirmed': True}
+        return {'remaining_m': .04 - actual[0]}
+
+    node.escape_velocity = SimpleNamespace(publish=publish)
+    node.parking_tf = SimpleNamespace(lookup_transform=lambda *_a, **_k:
+        SimpleNamespace(transform=SimpleNamespace(
+            translation=SimpleNamespace(x=position[0], y=0.),
+            rotation=SimpleNamespace(x=0., y=0., z=0., w=1.))))
+    monkeypatch.setattr(restaurant_service.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(restaurant_service.rclpy, 'spin_once', spin)
+    result = node._drive_zero_turn(
+        .2, precision=True, hold_heading=True, target_update=update)
+    assert result == pytest.approx(position[0])
+    assert not node.stop_requested
+    assert node.run_deadline_s > 10.5
+    assert any(e['event'] == 'rear_box_waiting_for_input' for e in _events(node))
+    waiting_s = next(e['monotonic_s'] for e in _events(node)
+                     if e['event'] == 'rear_box_waiting_for_input')
+    assert all(v == 0. for t, v in commands if waiting_s <= t < 10.5)
+    assert node._input_recovery_paused is previous_pause
+
+
+@pytest.mark.parametrize('previous_pause', [False, True])
+def test_first_measure_failure_exception_restores_deadline_timer(
+        monkeypatch, previous_pause):
+    node = route()
+    clock, position = [10.0], [0.0]
+    node.run_deadline_s = 12.0
+    node._input_recovery_paused = previous_pause
+    node._operator_link_ready = lambda: True
+    node.latest_motion = (clock[0], 0.0, 0.0)
+    node.escape_velocity = SimpleNamespace(publish=lambda _message: None)
+    node.parking_tf = SimpleNamespace(lookup_transform=lambda *_a, **_k:
+        SimpleNamespace(transform=SimpleNamespace(
+            translation=SimpleNamespace(x=position[0], y=0.),
+            rotation=SimpleNamespace(x=0., y=0., z=0., w=1.))))
+
+    def spin(*_a, **_k):
+        clock[0] += .02
+        raise RuntimeError('callback failed during zero flush')
+
+    monkeypatch.setattr(restaurant_service.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(restaurant_service, 'spin_node', spin)
+    with pytest.raises(RuntimeError, match='callback failed during zero flush'):
+        node._drive_zero_turn(
+            .2, precision=True, hold_heading=True,
+            target_update=Mock(side_effect=RuntimeError('rear box face unavailable')))
+    assert node._input_recovery_paused is previous_pause
+
+
+@pytest.mark.parametrize('terminal_failure', ['operator_link_lost', 'battery low'])
+def test_rear_input_pause_aborts_on_communication_or_battery_guard(
+        monkeypatch, terminal_failure):
+    node = route()
+    clock, position, velocity = [10.0], [0.0], [0.0]
+    commands = []
+    node.run_deadline_s = 14.0
+    node.latest_motion = (clock[0], 0.0, 0.0)
+    node._operator_link_ready = lambda: not (
+        terminal_failure == 'operator_link_lost' and clock[0] >= 11.0)
+    node._guard_failure = lambda *_a: (
+        'battery low: voltage=10.400V limit=10.500V'
+        if terminal_failure == 'battery low' and clock[0] >= 11.0 else None)
+    def publish(message):
+        velocity[0] = message.linear.x
+        commands.append((clock[0], message.linear.x))
+    def spin(*_a, **_k):
+        clock[0] += .02
+        position[0] += velocity[0] * .02
+        node.latest_motion = (clock[0], velocity[0], 0.0)
+    def update(actual):
+        if actual[0] > .01:
+            raise RuntimeError('rear box face unavailable')
+        return {'remaining_m': .04 - actual[0]}
+    node.escape_velocity = SimpleNamespace(publish=publish)
+    node.parking_tf = SimpleNamespace(lookup_transform=lambda *_a, **_k:
+        SimpleNamespace(transform=SimpleNamespace(
+            translation=SimpleNamespace(x=position[0], y=0.),
+            rotation=SimpleNamespace(x=0., y=0., z=0., w=1.))))
+    monkeypatch.setattr(restaurant_service.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(restaurant_service.rclpy, 'spin_once', spin)
+    assert node._drive_zero_turn(
+        .04, precision=True, hold_heading=True, target_update=update) is None
+    assert node._last_direct_motion_failure.startswith(terminal_failure)
+    waiting_s = next(e['monotonic_s'] for e in _events(node)
+                     if e['event'] == 'rear_box_waiting_for_input')
+    assert all(v == 0. for t, v in commands if t >= waiting_s)
+    assert clock[0] < 11.2
 
 
 @pytest.mark.parametrize('intermediate', [True, False])
@@ -4464,6 +4604,8 @@ def test_rear_recovery_checks_valid_arrival_before_another_motion_preview(
         clock[0] += .02
         position[0] += velocity[0] * .02
         node.latest_motion = (clock[0], velocity[0], 0.)
+        if clock[0] >= 11.0 and not (reached and not invalid):
+            node.stop_requested = True
     def update(actual):
         if len(watch_calls) >= 1:
             if invalid:
@@ -4534,3 +4676,41 @@ def test_obstacle_wait_does_not_restart_when_old_wait_duration_expires(monkeypat
     node._escape_blocked.assert_not_called()
     cleared = [e for e in _events(node) if e['event'] == 'path_blocked_cleared']
     assert cleared[0]['held_s'] > corridor_route.PATH_BLOCKED_WAIT_S
+
+
+def test_repeated_input_gaps_do_not_recount_previous_wait(monkeypatch):
+    node = route()
+    clock, position, velocity = [10.0], [0.0], [0.0]
+    node.run_deadline_s = 100.0
+    node._operator_link_ready = lambda: True
+    node.latest_motion = (clock[0], 0.0, 0.0)
+
+    def publish(message):
+        velocity[0] = message.linear.x
+
+    def spin(*_a, **_k):
+        clock[0] += .02
+        position[0] += velocity[0] * .02
+        node.latest_motion = (clock[0], velocity[0], 0.0)
+
+    def update(actual):
+        if ((actual[0] > .01 and clock[0] < 15.0)
+                or (actual[0] > .025 and clock[0] < 17.0)):
+            raise RuntimeError('rear box face unavailable')
+        return {'remaining_m': .06 - actual[0]}
+
+    node.escape_velocity = SimpleNamespace(publish=publish)
+    node.parking_tf = SimpleNamespace(lookup_transform=lambda *_a, **_k:
+        SimpleNamespace(transform=SimpleNamespace(
+            translation=SimpleNamespace(x=position[0], y=0.),
+            rotation=SimpleNamespace(x=0., y=0., z=0., w=1.))))
+    monkeypatch.setattr(restaurant_service.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(restaurant_service.rclpy, 'spin_once', spin)
+    result = node._drive_zero_turn(.06, precision=True, hold_heading=True,
+                                   target_update=update)
+    recovered = [e for e in _events(node) if e['event'] == 'rear_box_input_recovered']
+    assert result == pytest.approx(.06, abs=.003)
+    assert len(recovered) == 2
+    assert recovered[1]['paused_s'] <= 2.0
+    assert node.run_deadline_s - 100.0 <= clock[0] - 10.0
+    assert not node._input_recovery_paused

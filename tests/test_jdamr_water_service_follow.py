@@ -218,3 +218,13 @@ def test_mission_start_is_refused_during_init(tmp_path):
             node.start('web-A')
     finally:
         release.set()
+
+
+def test_failed_manual_order_is_not_restarted_by_follow_web(controller):
+    controller._state.update(order_id='A', request_id='manual-A', state='failed')
+    controller._record_request_terminal()
+    assert controller._state['requests']['manual-A']['order_id'] == 'A'
+    controller._state['order_id'] = None
+    assert controller.follow_web(order_state('A')) is None
+    controller.start.assert_not_called()
+    assert controller.follow_web(order_state('B')) == 'start B'

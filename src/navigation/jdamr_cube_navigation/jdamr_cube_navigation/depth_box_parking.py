@@ -117,6 +117,7 @@ class DepthBoxParkingNode(Node):
             ('random_seed', defaults.random_seed),
             ('processing_hz', 5.0),
             ('max_image_age_s', 0.5),
+            ('perception_enabled', True),
             ('optical_frame', 'camera_color_optical_frame'),
             ('calibration_model', 'rectified_projection'),
             ('stable_frames', 8),
@@ -203,6 +204,8 @@ class DepthBoxParkingNode(Node):
         processing_hz = float(self.get_parameter('processing_hz').value)
         self._max_image_age_s = float(
             self.get_parameter('max_image_age_s').value)
+        self._perception_enabled = bool(
+            self.get_parameter('perception_enabled').value)
         if not math.isfinite(processing_hz) or processing_hz <= 0.0:
             raise ValueError('processing_hz must be finite and positive')
         if (not math.isfinite(self._max_image_age_s)
@@ -214,11 +217,14 @@ class DepthBoxParkingNode(Node):
             self.get_parameter('calibration_model').value)
         self._minimum_period_s = 1.0 / processing_hz
         self._last_processed_s = -math.inf
+        self._processing_duration_estimate_s = None
+        self._freshness_skip_pending = False
+        self._precalculation_skips = 0
         self._last_depth_callback_s = time.monotonic()
         self._camera_info_history = CameraInfoHistory()
         self._camera_geometry = None
         self._status = self.create_publisher(
-            String, '/box_parking/perception_status', 10)
+            String, '/box_parking/perception_status', 1)
         self._create_depth_subscriptions()
         self.create_timer(
             self._max_image_age_s,
@@ -280,9 +286,16 @@ class DepthBoxParkingNode(Node):
         region = getattr(self, '_table_region_map', None)
         calibration_id = getattr(self, '_table_calibration_id', '')
         request_enabled = getattr(self, '_table_request_enabled', False)
+        perception_enabled = getattr(self, '_perception_enabled', True)
         for parameter in parameters:
             value = parameter.value
             name = parameter.name
+            if name == 'perception_enabled':
+                if not isinstance(value, bool):
+                    return SetParametersResult(
+                        successful=False, reason='perception flag must be bool')
+                perception_enabled = value
+                continue
             if name == 'table_request_enabled':
                 if not isinstance(value, bool):
                     return SetParametersResult(
@@ -356,23 +369,37 @@ class DepthBoxParkingNode(Node):
             mode != getattr(self, '_surface_mode', 'front')
             or region != getattr(self, '_table_region_map', None)
             or request_enabled != getattr(self, '_table_request_enabled', False)
+            or perception_enabled != getattr(self, '_perception_enabled', True)
             or calibration_id != getattr(self, '_table_calibration_id', '')
             or any(getattr(candidate_table, name) != getattr(table_config, name)
                    for name in ('camera_height_m', 'camera_roll_rad', 'camera_pitch_rad')))
         changed = candidate_table != table_config or reference_changed
+        perception_changed = (
+            perception_enabled != getattr(self, '_perception_enabled', True))
         if parameters:
             self._config = replace(self._config, **common_updates)
             self._table_config = candidate_table
             self._surface_mode = mode
+            self._perception_enabled = perception_enabled
             self._table_region_map = region
             self._table_request_enabled = request_enabled
             self._table_calibration_id = calibration_id
             if reference_changed:
                 self._table_region_odom = None
             if changed:
+                self._processing_duration_estimate_s = None
+                self._freshness_skip_pending = False
                 self._stability.update(None)
                 if getattr(self, '_table_tracker', None) is not None:
                     self._table_tracker.reset()
+            if perception_changed and hasattr(self, '_status'):
+                self._publish({
+                    'detected': False,
+                    'stable': False,
+                    'stable_frame_count': 0,
+                    'reason': ('perception_enabled_waiting_for_depth'
+                               if perception_enabled else 'perception_disabled'),
+                })
         return SetParametersResult(successful=True)
 
     @staticmethod
@@ -402,17 +429,22 @@ class DepthBoxParkingNode(Node):
         if timing_markers is not None:
             callback_started_s, calculation_started_s, calculation_finished_s = timing_markers
             publish_boundary_s = time.monotonic()
+            processing_duration_s = publish_boundary_s - callback_started_s
+            self._processing_duration_estimate_s = processing_duration_s
             document = {
                 **document,
                 'input_decode_duration_s': calculation_started_s - callback_started_s,
                 'calculation_duration_s': calculation_finished_s - calculation_started_s,
                 'postprocess_duration_s': publish_boundary_s - calculation_finished_s,
-                'processing_duration_s': publish_boundary_s - callback_started_s,
+                'processing_duration_s': processing_duration_s,
+                'precalculation_skipped_frames': getattr(
+                    self, '_precalculation_skips', 0),
                 'previous_status_serialization_duration_s': getattr(
                     self, '_last_status_serialization_duration_s', None),
                 'previous_status_publish_duration_s': getattr(
                     self, '_last_status_publish_duration_s', None),
             }
+            self._precalculation_skips = 0
         document = {**document, 'control_ready': False}
         message = String()
         serialization_started_s = time.monotonic()
@@ -443,6 +475,7 @@ class DepthBoxParkingNode(Node):
 
     def _reset_measurements(self) -> None:
         """Discard accumulated observations after input geometry or time changes."""
+        self._freshness_skip_pending = False
         self._stability.update(None)
         if getattr(self, '_table_tracker', None) is not None:
             self._table_tracker.reset()
@@ -451,7 +484,11 @@ class DepthBoxParkingNode(Node):
         """Adapt optional component/tracking output to the existing observer contract."""
         if (not getattr(self, '_table_components', False)
                 or not getattr(self, '_table_request_enabled', False)):
-            return detect_table_edge(depth_mm, intrinsics, self._table_config), {}, None
+            plane = {}
+            detection = detect_table_edge(
+                depth_mm, intrinsics, self._table_config, plane_result=plane)
+            fields = {'tabletop_plane': plane} if plane else {}
+            return detection, fields, None
         region_map = getattr(self, '_table_region_map', None)
         needs_transform = self._table_tracker is not None or region_map is not None
         transform, transform_error = None, None
@@ -519,15 +556,50 @@ class DepthBoxParkingNode(Node):
                   and track.stable_frames >= self._table_tracker.config.required_frames)
         return track.detection, fields, stable
 
+    def _skip_for_fresher_depth(self, stamp_s, now_s):
+        """Yield one predicted-late callback so depth=1 can supply its newest frame."""
+        estimate_s = getattr(self, '_processing_duration_estimate_s', None)
+        if (not isinstance(estimate_s, (int, float))
+                or isinstance(estimate_s, bool) or not math.isfinite(estimate_s)
+                or estimate_s <= 0.0):
+            self._freshness_skip_pending = False
+            return False
+        age_s = now_s - stamp_s
+        if (not math.isfinite(age_s) or not 0.0 <= age_s <= self._max_image_age_s):
+            self._freshness_skip_pending = False
+            return False
+        # Reserve half one configured processing period for JSON publication,
+        # DDS delivery and the control callback to consume the result.
+        delivery_headroom_s = min(
+            self._minimum_period_s / 2.0, self._max_image_age_s / 2.0)
+        completion_budget_s = max(0.0, self._max_image_age_s - delivery_headroom_s)
+        if age_s + estimate_s <= completion_budget_s:
+            self._freshness_skip_pending = False
+            return False
+        if getattr(self, '_freshness_skip_pending', False):
+            # Never starve a slow or remotely delayed stream. One quick return is
+            # enough for KEEP_LAST depth=1 to replace this callback with its newest.
+            self._freshness_skip_pending = False
+            return False
+        self._freshness_skip_pending = True
+        self._precalculation_skips = getattr(self, '_precalculation_skips', 0) + 1
+        return True
+
     def _on_depth(self, message: Image) -> None:
+        if not getattr(self, '_perception_enabled', True):
+            return
         now_s = time.monotonic()
         self._last_depth_callback_s = now_s
         if now_s - self._last_processed_s < self._minimum_period_s:
             return
-        self._last_processed_s = now_s
         try:
             table_fields, table_stable = {}, None
             ros_now_s = self.get_clock().now().nanoseconds * 1e-9
+            stamp_s = (message.header.stamp.sec
+                       + message.header.stamp.nanosec * 1e-9)
+            if self._skip_for_fresher_depth(stamp_s, ros_now_s):
+                return
+            self._last_processed_s = now_s
             info = self._camera_info_history.select(
                 stamp_nanoseconds(message.header.stamp),
                 maximum_lag_ns=round(self._max_image_age_s * 1e9))
@@ -542,6 +614,7 @@ class DepthBoxParkingNode(Node):
             previous_geometry = getattr(self, '_camera_geometry', None)
             if (self._camera_info_history.rewound
                     or (previous_geometry is not None and geometry != previous_geometry)):
+                self._processing_duration_estimate_s = None
                 self._reset_measurements()
             self._camera_geometry = geometry
             calculation_started_s = time.monotonic()
@@ -571,6 +644,23 @@ class DepthBoxParkingNode(Node):
             'camera_info_age_s': stamp_s - info_stamp_s if info_stamp_s else None,
             'camera_info_mode': 'stamped' if info_stamp_s else 'static',
         }
+        if (not math.isfinite(age_s)
+                or not 0.0 <= age_s <= self._max_image_age_s):
+            self._reset_measurements()
+            self._publish({
+                'stamp_s': stamp_s,
+                'age_s': age_s,
+                **timing,
+                **table_fields,
+                'frame_id': message.header.frame_id,
+                'detected': False,
+                'stable': False,
+                'stable_frame_count': 0,
+                'reason': 'expired_during_processing',
+                'control_ready': False,
+            }, timing_markers=(
+                now_s, calculation_started_s, calculation_finished_s))
+            return
         stable = self._stability.update(detection)
         if table_stable is not None:
             stable = table_stable

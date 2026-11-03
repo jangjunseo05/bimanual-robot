@@ -875,3 +875,18 @@ def test_control_page_init_reaches_the_drive_pc_and_returns_its_result(server, t
 def test_control_page_has_the_drive_init_button():
     assert 'id="drive-init"' in CONTROL_PAGE.read_text(encoding="utf-8")
     assert '"/api/drive/init"' in CONTROL_JS.read_text(encoding="utf-8")
+
+
+def test_failed_drive_init_keeps_accepted_order_without_releasing_start(tmp_path):
+    app = _gated_app(tmp_path)
+    _link_drive(app)
+    order_id = _accepted_order(app)
+    request_id = app.request_drive_init()["drive_init"]["id"]
+    app.drive_heartbeat({"init": {"id": request_id, "state": "failed", "message": "scan mismatch"}})
+    assert app.state()["start"] == {"ready": False, "reason": "drive_init_failed", "order_id": order_id}
+    with pytest.raises(OrderStateError, match="drive_init_failed"):
+        app.start_mission()
+    assert app.controller.accepted_orders()[0].order_id == order_id
+    app.drive_heartbeat({"init": {"id": request_id, "state": "succeeded", "message": "init complete"}})
+    assert app.state()["start"]["ready"] is False  # terminal result cannot be overwritten
+    app.close()

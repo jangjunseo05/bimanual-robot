@@ -476,6 +476,58 @@ def test_tracker_clears_history_when_observation_is_missing():
     assert tracker.frame_count == 0
 
 
+def test_tracker_tolerates_two_missing_frames_in_one_bounded_window():
+    result = estimate(recorded_scans()[0])
+    tracker = RearBoxFaceTracker(required_frames=3, max_missing_frames=2)
+
+    assert tracker.update(result) is False
+    assert tracker.update(None) is False
+    assert tracker.update(None) is False
+    assert tracker.frame_count == 1
+    assert tracker.update(result) is False
+    assert tracker.update(result) is True
+
+
+def test_tracker_resets_after_missing_frame_allowance_is_exceeded():
+    result = estimate(recorded_scans()[0])
+    tracker = RearBoxFaceTracker(required_frames=2, max_missing_frames=2)
+
+    assert tracker.update(result) is False
+    assert tracker.update(None) is False
+    assert tracker.update(None) is False
+    assert tracker.update(None) is False
+    assert tracker.frame_count == 0
+
+
+def test_tracker_does_not_accumulate_valid_faces_across_unbounded_gaps():
+    result = estimate(recorded_scans()[0])
+    tracker = RearBoxFaceTracker(required_frames=3, max_missing_frames=1)
+
+    assert tracker.update(result) is False
+    assert tracker.update(None) is False
+    assert tracker.update(result) is False
+    assert tracker.update(None) is False
+    assert tracker.update(result) is False
+    assert tracker.frame_count == 2
+
+
+def test_tracker_reset_discards_missing_tolerant_history():
+    result = estimate(recorded_scans()[0])
+    tracker = RearBoxFaceTracker(required_frames=2, max_missing_frames=2)
+
+    assert tracker.update(result) is False
+    assert tracker.update(None) is False
+    tracker.reset()
+    assert tracker.frame_count == 0
+    assert tracker.update(result) is False
+
+
+@pytest.mark.parametrize('max_missing_frames', [True, -1, 1.5])
+def test_tracker_rejects_invalid_missing_frame_allowance(max_missing_frames):
+    with pytest.raises(ValueError, match='max_missing_frames'):
+        RearBoxFaceTracker(max_missing_frames=max_missing_frames)
+
+
 def test_diagnostics_expose_selection_without_changing_result():
     diagnostics = {}
     scan = recorded_scans()[0]

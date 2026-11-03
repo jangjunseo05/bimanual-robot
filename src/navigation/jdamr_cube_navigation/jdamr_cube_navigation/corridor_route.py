@@ -43,6 +43,8 @@ AMCL_QOS = QoSProfile(
     durability=DurabilityPolicy.TRANSIENT_LOCAL,
 )
 ODOM_QOS = QoSProfile(depth=1)
+# Control needs the newest scan, not a backlog after a slow geometry update.
+SCAN_QOS = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
 NAVIGATION_BEHAVIOR_TREES = {
     'corridor': 'navigate_to_pose_corridor_fail_fast.xml',
     'obstacle_candidate': 'navigate_to_pose_dynamic_obstacle_eval.xml',
@@ -372,7 +374,7 @@ class CorridorRoute(Node):
         self.create_subscription(
             Odometry, '/odom', self._odom_callback, ODOM_QOS)
         self.create_subscription(
-            LaserScan, '/scan', self._scan_callback, qos_profile_sensor_data)
+            LaserScan, '/scan', self._scan_callback, SCAN_QOS)
         self.create_subscription(
             PoseWithCovarianceStamped, '/amcl_pose', self._amcl_callback,
             AMCL_QOS)
@@ -571,7 +573,17 @@ class CorridorRoute(Node):
             self.parking_motion_revision += 1
 
     def _scan_callback(self, _message):
-        self.samples['scan'] = time.monotonic()
+        now_s = time.monotonic()
+        previous_s = self.samples.get('scan')
+        timing = {'receive_gap_s': None if previous_s is None else now_s - previous_s}
+        try:
+            stamp = _message.header.stamp
+            timing['stamp_age_s'] = (self.get_clock().now().nanoseconds * 1e-9
+                                     - stamp.sec - stamp.nanosec * 1e-9)
+        except (AttributeError, TypeError, ValueError):
+            timing['stamp_age_s'] = None
+        self.scan_input_timing = timing
+        self.samples['scan'] = now_s
 
     def _joint_state_callback(self, message):
         self.samples['joint_states'] = time.monotonic()

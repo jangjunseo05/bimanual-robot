@@ -11,6 +11,8 @@ from __future__ import annotations
 from copy import deepcopy
 import json
 import os
+import re
+import shlex
 from pathlib import Path
 import subprocess
 import sys
@@ -114,6 +116,10 @@ class WaterServiceController:
                 finished_unix_s=None,
                 mission_directory=str(mission_dir),
                 parking_run=None,
+                parking_log_on_pi=None,
+                navigation_run=None,
+                navigation_log_on_pi=None,
+                navigation_failure_reason=None,
                 order_id=None,
                 windows_result=None,
                 table_parking_run=None,
@@ -154,6 +160,110 @@ class WaterServiceController:
             view["order_url"] = self.inference_url
             view["configured"] = bool(self.inference_url) if self.run_inference else True
             return view
+
+    @staticmethod
+    def _tail_text(path: Path, maximum_bytes: int = 65536) -> str:
+        with path.open("rb") as stream:
+            stream.seek(0, 2)
+            stream.seek(max(0, stream.tell() - maximum_bytes))
+            return stream.read(maximum_bytes).decode("utf-8", errors="replace")
+
+    @staticmethod
+    def _last_navigation_submission(path: Path) -> str | None:
+        """Find the latest submitted run even after its line leaves the display tail."""
+        latest = None
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            for line in stream:
+                match = re.search(r"\bSUBMITTED[^\n]*\blog (\S+)/cycle_events\.jsonl", line)
+                if match:
+                    latest = Path(match.group(1)).name
+        return latest
+
+    def _record_navigation_run(self, arguments: list[str], started_s: float) -> None:
+        """Associate failed and successful helpers with this request, never an older run."""
+        try:
+            expected = (self._session_directory() / "runtime/runs").resolve()
+            if self._log_path is None or not self._log_path.is_file():
+                return
+            submitted = self._last_navigation_submission(self._log_path)
+            if not submitted:
+                return
+            run = (expected / submitted).resolve()
+            command = run / "command.txt"
+            if run.parent != expected or not command.is_file():
+                return
+            if command.stat().st_mtime < started_s - 1.0:
+                return
+            table_id = arguments[1] if arguments[:1] == ["go"] and len(arguments) > 1 else None
+            if table_id is None or f"--table-id {table_id}" not in command.read_text():
+                return
+            remote = self._remote_cycle_log(run)
+            reason = None
+            if self._log_path is not None and self._log_path.is_file():
+                matches = re.findall(r"STOP: execution stopped: (.+?) \(code=", self._tail_text(self._log_path))
+                reason = matches[-1] if matches else None
+            with self._lock:
+                self._state.update(navigation_run=str(run), navigation_log_on_pi=remote,
+                                   navigation_failure_reason=reason)
+                if self._state.get("phase") == "parking":
+                    self._state.update(parking_run=str(run), parking_log_on_pi=remote)
+                self._save_state()
+        except (OSError, ValueError, KeyError, RuntimeError):
+            # Missing diagnostics cannot turn a completed robot stage into failure.
+            return
+
+    def logs(self) -> dict[str, Any]:
+        """Read this mission's local output and a bounded tail of its Pi events."""
+        view = self.status()
+        directory = view.get("mission_directory")
+        result = {"mission_id": view.get("mission_id"), "state": view.get("state"),
+                  "phase": view.get("phase"), "error": view.get("error"),
+                  "navigation_failure_reason": view.get("navigation_failure_reason"),
+                  "controller_lines": [], "navigation_events": [], "navigation_error": None}
+        if not directory:
+            return result
+        run = Path(directory).resolve()
+        if run.parent != (self.state_directory / "runs").resolve():
+            raise RuntimeError("mission log is outside the managed state directory")
+        log_path = run / "controller.log"
+        result["controller_log"] = str(log_path)
+        if log_path.is_file():
+            result["controller_lines"] = self._tail_text(log_path).splitlines()[-160:]
+        try:
+            expected = (self._session_directory() / "runtime/runs").resolve()
+            if view.get("state") != "running" and view.get("navigation_run"):
+                candidate = Path(view["navigation_run"]).resolve()
+            else:
+                submitted = self._last_navigation_submission(log_path) if log_path.is_file() else None
+                if not submitted:
+                    return result
+                candidate = (expected / submitted).resolve()
+            command = candidate / "command.txt"
+            if (candidate.parent != expected or not command.is_file()
+                    or command.stat().st_mtime < float(view.get("started_unix_s") or float("inf")) - 1.0):
+                return result
+            remote = self._remote_cycle_log(candidate)
+            peer = os.environ.get("JDAMR_PI_HOST", os.environ.get("JDAMR_HOST", "lim@192.168.0.159"))
+            if not re.fullmatch(r"[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+", peer):
+                raise RuntimeError("invalid Pi SSH peer")
+            response = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", peer,
+                 "tail -n 80 -- " + shlex.quote(remote)],
+                capture_output=True, text=True, timeout=8, check=False)
+            result.update(navigation_run=str(candidate), navigation_log_on_pi=remote)
+            if response.returncode:
+                result["navigation_error"] = response.stderr.strip()[-300:] or "Pi log unavailable"
+            else:
+                for line in response.stdout.splitlines():
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(event, dict):
+                        result["navigation_events"].append(event)
+        except (OSError, ValueError, KeyError, RuntimeError, subprocess.SubprocessError) as error:
+            result["navigation_error"] = str(error)
+        return result
 
     def stop(self) -> dict[str, Any]:
         """Cancel only the active stage; cancellation never starts dock return."""
@@ -233,7 +343,10 @@ class WaterServiceController:
         if dry_run:
             return self._announce_once(request_id, f"would_start {order_id}")
         with self._lock:
-            if request_id in self._state.setdefault("requests", {}):
+            requests = self._state.setdefault("requests", {})
+            if (request_id in requests or self._state.get("order_id") == order_id
+                    or any(item.get("order_id") == order_id
+                           for item in requests.values())):
                 return None
         self.start(request_id)
         return f"start {order_id}"
@@ -357,6 +470,7 @@ class WaterServiceController:
                 self._process = None
 
     def _run_helper(self, arguments: list[str]) -> None:
+        started_s = time.time()
         command = [sys.executable, str(DEPART_HELPER), "--map-session", str(self.map_session)]
         command.extend(arguments)
         assert self._log_path is not None
@@ -392,11 +506,14 @@ class WaterServiceController:
             with self._lock:
                 if self._process is process:
                     self._process = None
+            self._record_navigation_run(arguments, started_s)
             if process.returncode != 0:
                 if self._stop_event.is_set():
                     raise _Stopped()
+                reason = self._state.get("navigation_failure_reason")
+                detail = f"navigation failed: {reason}; " if reason else ""
                 raise RuntimeError(
-                    f"jdamr_depart.py exited with code {process.returncode}; see {self._log_path}"
+                    f"{detail}jdamr_depart.py exited with code {process.returncode}; see {self._log_path}"
                 )
 
     def _run_stop_helper(self) -> None:
@@ -545,6 +662,10 @@ class WaterServiceController:
             raise RuntimeError("order server did not return an order_id")
         with self._lock:
             self._state["order_id"] = order_id
+            request_id = self._state.get("request_id")
+            if request_id:
+                self._state.setdefault("requests", {}).setdefault(request_id, {})[
+                    "order_id"] = order_id
             self._save_state()
 
     def _drive_ready(self, state: dict[str, Any], destination: str) -> bool:
@@ -648,6 +769,7 @@ class WaterServiceController:
             "phase": self._state.get("phase"),
             "mode": self._state.get("mode"),
             "error": self._state.get("error"),
+            "order_id": self._state.get("order_id"),
         }
 
     def _load_state(self) -> dict[str, Any]:

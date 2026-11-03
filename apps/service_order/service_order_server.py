@@ -377,6 +377,8 @@ class ServiceApplication:
             reason = "mission_running"
         elif self.drive_init["state"] in DRIVE_INIT_ACTIVE:
             reason = "drive_init_running"
+        elif self.drive_init["state"] == "failed":
+            reason = "drive_init_failed"
         elif not accepted:
             reason = "no_accepted_order"
         elif backend_info.get("manipulation_service_state") not in (None, "ready"):

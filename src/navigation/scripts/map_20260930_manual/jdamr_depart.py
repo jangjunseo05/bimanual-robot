@@ -907,8 +907,7 @@ def refine_at_registered_dock(scan_path, click, reference, *, diagnostics=None):
         # Use matched support in both scans; residual, sectors and uniqueness
         # still distinguish the anchor from another placement.
         if (min(np.count_nonzero(inliers), np.count_nonzero(reference_inliers))
-                < minimum_matched_points
-                or supported_sectors < 3):
+                < minimum_matched_points):
             return reject('dock_match_common_support_insufficient',
                           current_support=int(np.count_nonzero(inliers)),
                           reference_support=int(np.count_nonzero(reference_inliers)),
@@ -954,6 +953,17 @@ def refine_at_registered_dock(scan_path, click, reference, *, diagnostics=None):
                                       fixed_support_mean_m=fixed_support_mean,
                                       trial=uniqueness_trials[-1])
                     ambiguous_translations.append(uniqueness_trials[-1])
+        # Quadrant boundaries are arbitrary: the same spatial support can move
+        # between bins after a small pose change. Sector count never rejects a
+        # match by itself. With support in fewer than three bins, however, every
+        # fixed-support translation and rotation trial must be strictly worse;
+        # the registered-region translation allowance is disabled.
+        if supported_sectors < 3 and ambiguous_translations:
+            return reject('dock_match_limited_angular_support_not_unique',
+                          fixed_support_mean_m=fixed_support_mean,
+                          supported_sectors=supported_sectors,
+                          uniqueness_trials=uniqueness_trials,
+                          ambiguous_translation_trials=ambiguous_translations)
         pose = registered_pose(relative)
         if not inside_registered_region(pose):
             return reject('dock_match_outside_registered_region', matched_pose=pose)
@@ -1269,7 +1279,8 @@ def execution_failure_cause(events):
         if (event.get('event') == 'precision_straight_finished'
                 and event.get('target_failure')):
             return str(event['target_failure'])
-        if (event.get('event') in ('straight_drive_stopped', 'rear_box_coarse_paused')
+        if (event.get('event') in ('straight_drive_stopped', 'rear_box_coarse_paused',
+                                   'trim_rotation_stopped')
                 and event.get('reason') not in (None, 'rear box coarse handoff ready')):
             return str(event['reason'])
     return None
@@ -1576,11 +1587,11 @@ def cmd_go(args):
     reapproach_m = getattr(args, 'reapproach_m', None)
     correction_m = getattr(args, 'station_left_correction_m', 0.0)
     if reapproach_m is not None:
-        if not (math.isfinite(reapproach_m) and 0.2 <= reapproach_m <= 0.45
+        if not (math.isfinite(reapproach_m) and 0.2 <= reapproach_m <= 0.50
                 and len(tables) == 1 and args.park_only and surface_mode == 'table_edge'
                 and not (args.dock_only or args.rear_box_only or with_via
                          or args.resume_parked_log or tables[0] != VIA_ID and not args.skip_via)):
-            fail('--reapproach-m requires one --park-only table_edge station, 0.2–0.45 m')
+            fail('--reapproach-m requires one --park-only table_edge station, 0.2–0.50 m')
     if (not math.isfinite(correction_m) or abs(correction_m) > 0.05
             or correction_m and reapproach_m is None):
         fail('--station-left-correction-m requires --reapproach-m and at most 0.05 m')

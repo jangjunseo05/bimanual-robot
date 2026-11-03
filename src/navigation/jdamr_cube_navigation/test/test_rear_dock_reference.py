@@ -277,7 +277,7 @@ def test_lateral_drift_uses_one_static_checked_curve_to_twenty_cm_handoff(
     node._odom_path = Mock(return_value='frozen landmark curve')
     node._execute_reverse_once = Mock(return_value=True)
     if not clear and not exact_clear:
-        with pytest.raises(RuntimeError, match='static corridor blocked'):
+        with pytest.raises(RuntimeError, match='keepout or unknown corridor blocked'):
             node._center_rear_box(observation, .275)
         node._execute_reverse_once.assert_not_called()
         return
@@ -328,8 +328,8 @@ def test_already_centered_return_does_not_add_reverse_or_turn():
     node._make_reverse_path.assert_not_called()
 
 
-@pytest.mark.parametrize('lateral_m', [-.049, .049])
-def test_center_within_operator_five_cm_tolerance_skips_curve(lateral_m):
+@pytest.mark.parametrize('lateral_m', [-.020, .020])
+def test_center_within_operator_two_cm_tolerance_skips_curve(lateral_m):
     node = node_with_reference()
     pose = (.15, lateral_m, 0.)
     node._odom_pose = Mock(return_value=pose)

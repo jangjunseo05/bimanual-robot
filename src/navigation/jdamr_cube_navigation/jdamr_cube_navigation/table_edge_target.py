@@ -2,6 +2,8 @@
 
 import math
 
+import numpy as np
+
 from .box_docking_target import (
     _finite_fields,
     _finite_number,
@@ -20,6 +22,80 @@ MINIMUM_UP_DOT = 0.80
 MAXIMUM_EDGE_RMS_M = 0.01
 MAXIMUM_EDGE_VERTICAL_DELTA_M = 0.05
 MAXIMUM_HEIGHT_DISAGREEMENT_M = 0.05
+# One 5 Hz depth-observer period plus half a 10 Hz RGB period.
+MAXIMUM_TAPE_RGB_DEPTH_DELTA_S = 0.25
+
+
+def table_tape_surface_at_rgb(observation, camera_mount, depth_pose_odom,
+                              rgb_pose_odom, rgb_stamp_s, now_s):
+    """Carry a measured tabletop plane to the RGB camera's exposure pose.
+
+    Current tabletop up supplies roll/pitch; mount yaw and the measured planar
+    camera lever remain explicit calibration inputs. No historical plane is used.
+    """
+    mount = _validated_mount(camera_mount)
+    if not isinstance(observation, dict):
+        raise ValueError('live tabletop observation must be a mapping')
+    plane = observation.get('tabletop_plane')
+    if plane is not None:
+        if (not isinstance(plane, dict)
+                or plane.get('source') != 'current_depth_tabletop_fit'):
+            raise ValueError('live tabletop plane source invalid')
+        up = np.asarray(_finite_vector(
+            plane.get('plane_normal_optical'), 3, 'tabletop normal'))
+        point = np.asarray(_finite_vector(
+            plane.get('plane_point_optical_m'), 3, 'tabletop point'))
+        rms = _finite_number(plane.get('plane_rms_m'), 'tabletop plane rms')
+        height = _finite_number(plane.get('table_height_m'), 'tabletop height')
+        support = plane.get('inlier_count')
+        if (not math.isclose(float(np.linalg.norm(up)), 1., abs_tol=1e-3)
+                or _optical_vector_to_base(up, mount)[2] < MINIMUM_UP_DOT
+                or not 0. <= rms <= MAXIMUM_EDGE_RMS_M
+                or not .5 <= height <= 1.05
+                or not isinstance(support, int) or isinstance(support, bool)
+                or support < 3):
+            raise ValueError('live tabletop plane quality invalid')
+    else:
+        _validated_table_observation(observation, mount, now_s, require_stable=False)
+        up = np.asarray(observation['plane_normal'], dtype=float)
+        point = np.mean(observation['edge_endpoints_optical_m'], axis=0)
+    rgb_stamp = _finite_number(rgb_stamp_s, 'rgb_stamp_s')
+    depth_stamp = _finite_number(observation['stamp_s'], 'depth_stamp_s')
+    if (not 0. <= now_s - depth_stamp <= MAXIMUM_OBSERVATION_AGE_S
+            or not 0. <= now_s - rgb_stamp <= MAXIMUM_OBSERVATION_AGE_S
+            or abs(rgb_stamp - depth_stamp) > MAXIMUM_TAPE_RGB_DEPTH_DELTA_S):
+        raise ValueError('tape RGB/depth exposure mismatch')
+    poses = [_finite_vector(pose, 3, 'base_pose_odom')
+             for pose in (depth_pose_odom, rgb_pose_odom)]
+    up /= np.linalg.norm(up)
+    forward = np.array([0., 0., 1.]) - up[2] * up
+    norm = np.linalg.norm(forward)
+    if norm < 0.1:
+        raise ValueError('tabletop forward axis unobservable')
+    forward /= norm
+    left = np.cross(up, forward)
+    left /= np.linalg.norm(left)
+
+    def turn(yaw):
+        c, s = math.cos(yaw), math.sin(yaw)
+        return np.array([[c, -s, 0.], [s, c, 0.], [0., 0., 1.]])
+
+    rotation = turn(mount[5]) @ np.vstack([forward, left, up])
+    world_rotations = [turn(pose[2]) @ rotation for pose in poses]
+    origins = [np.array([pose[0], pose[1], 0.])
+               + turn(pose[2]) @ np.asarray(mount[:3]) for pose in poses]
+    world_point = world_rotations[0] @ point + origins[0]
+    rgb_point = world_rotations[1].T @ (world_point - origins[1])
+    rgb_normal = world_rotations[1].T @ world_rotations[0] @ up
+    return {
+        'source': 'live_depth_table_plane',
+        'stamp_s': depth_stamp,
+        'rgb_stamp_s': rgb_stamp,
+        'plane_normal_optical': rgb_normal.tolist(),
+        'plane_point_optical_m': rgb_point.tolist(),
+        'R_base_from_optical': rotation.tolist(),
+        'camera_lever_xy_m': list(mount[:2]),
+    }
 
 
 def _finite_vector(value, length, label):

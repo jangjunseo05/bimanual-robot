@@ -158,7 +158,7 @@ def face_approach_waypoints(start, face, normal, front_extent_m, half_width_m,
                             approach_time_s=FACE_APPROACH_TIME_S, allow_near_alignment=False,
                             continuous_table=False, lateral_tracking=False,
                             lateral_goal_odom=None, lateral_tolerance_m=None,
-                            max_lateral_heading_rad=None):
+                            max_lateral_heading_rad=None, lateral_entry_gap_m=None):
     """Preview the same command law up to the existing final precision band.
 
     This ideal odometry rollout is for static corridor validation, not evidence
@@ -192,6 +192,14 @@ def face_approach_waypoints(start, face, normal, front_extent_m, half_width_m,
             raise ValueError('invalid lateral preview control contract')
     else:
         lateral_goal = None
+    if lateral_entry_gap_m is not None and (
+            not lateral_tracking or isinstance(lateral_entry_gap_m, bool)
+            or not isinstance(lateral_entry_gap_m, (int, float))
+            or not math.isfinite(lateral_entry_gap_m)
+            or lateral_entry_gap_m <= target_gap_m):
+        raise ValueError('invalid lateral alignment entry gap')
+    acquisition_goal = start[:2]
+    lateral_entered = lateral_entry_gap_m is None
     alignment_gap_m = (target_gap_m if lateral_tracking
                        else max(FACE_ALIGNMENT_GAP_M, target_gap_m))
     heading = math.atan2(-normal[1], -normal[0])
@@ -213,8 +221,10 @@ def face_approach_waypoints(start, face, normal, front_extent_m, half_width_m,
         remaining_gap = center_gap if lateral_tracking else gap
         remaining = (remaining_gap - target_gap_m) / math.cos(error)
         if lateral_tracking:
+            lateral_entered = lateral_entered or gap <= lateral_entry_gap_m
+            tracking_goal = lateral_goal if lateral_entered else acquisition_goal
             left = (-math.sin(heading), math.cos(heading))
-            lateral_error = sum((lateral_goal[i] - pose[i]) * left[i] for i in (0, 1))
+            lateral_error = sum((tracking_goal[i] - pose[i]) * left[i] for i in (0, 1))
             command_error = None
         else:
             command_error = math.atan2(math.sin(command_heading - pose[2]),

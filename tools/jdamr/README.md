@@ -249,6 +249,45 @@ python3 tools/jdamr/water_service_api.py serve --order-url http://192.168.0.157:
 - 주문 서버는 수락과 START 전에는 주문을 시작하지 않는다. `--follow-web` 없이 `start`만 실행하면
   진행 중 주문에 연결되고, 진행 중 주문이 없으면 새 주문이 `PENDING`에 머물러 300초 뒤 실패한다.
 
+미션 출력과 Pi 주행 이벤트는 아래 명령으로 조회한다. `watch`를 끝내도 로봇에 정지 명령을 보내지 않는다.
+
+```bash
+cd "$HOME/bimanual-robot"
+python3 tools/jdamr/water_service_api.py logs
+python3 tools/jdamr/water_service_api.py watch
+```
+
+인증된 `GET /api/mission/logs`도 같은 자료를 반환한다. 웹 START 이후 시나리오는 주행 PC 서비스가 수행하며, Codex 대화를 자동으로 시작하지는 않는다. 대화가 활성 상태일 때 이 자료로 진행 상황과 오류를 확인할 수 있다.
+
+### 주행 PC에서 전체 서비스 준비·종료
+
+Windows SSH가 설정돼 있으면 아래 명령으로 Windows 화면을 조작하지 않고 관리한다.
+`init`은 기존 도크 위치초기화 명령이며, 전체 서비스 준비는 `scenario_runtime.py prepare`다.
+
+```bash
+cd "$HOME/bimanual-robot"
+python3 tools/jdamr/scenario_runtime.py prepare
+python3 tools/jdamr/scenario_runtime.py status
+python3 tools/jdamr/scenario_runtime.py stop
+```
+
+`prepare`는 Windows Astra 송신·관제8765·팔 실행기8770, PC 웹 추종 서버를 준비하고,
+팔 모델 ready·주행 연결·웹 위치초기화 완료를 기다린다. 주문·팔 접기·물따르기·컵배치·주행은
+시작하지 않는다. 준비 뒤 관제에서 주문을 수락하고 START하거나 기존 출발 명령을 사용한다.
+시작 시 그리퍼 사전 이완은 건너뛰고 기존 팔·카메라·모델 설정은 Windows의
+`tools/rollout/start_scenario.bat`에서 읽는다. 중복 프로세스는 새로 띄우지 않는다.
+팔 실행기 ready만으로 팔 접기 완료를 의미하지 않으며, 접기는 주문 START에서 수행한다.
+
+한 서비스만 관리할 때는 `--component arms|camera|order`를 사용한다. 주소 변경은
+`--windows user@새IP --order-url http://새IP:8765`로 지정한다. 카메라 전송 목적지는
+Windows의 `JDAMR_PI_ENDPOINT`로 설정할 수 있다. 기본값은 `192.168.0.159:5600`이다.
+`stop`은 진행 중인 미션의 기존 정지 경로를 먼저 호출한다. 팔이 컵을 쥐고 있거나 작업 중이면
+강제 종료해 떨어뜨리지 않고 상태를 보고한다. 준비 직후 팔 자세가 아직 `unknown`인 경우에도
+종료 시 그리퍼가 이완되는 기존 실행기 특성 때문에 종료를 보류한다. 이 경우 팔 상태를 확인해
+토크 해제·종료를 별도로 지시한다. 준비 도중 실패한 프로세스는 상태와 로그를 남기며,
+불확실한 팔을 자동 강제 종료하지 않는다. 상태 출력의 PID·로그 경로를 진단에 사용한다.
+Windows에서 바꾼 Python/COM/모델 경로가 있으면 bat에 반영한 뒤 준비한다.
+
 ### Windows 공유 Astra 입력
 
 현재 주행의 센서 입력 기본값은 `JDAMR_CAMERA_TRANSPORT=windows_tcp`다.

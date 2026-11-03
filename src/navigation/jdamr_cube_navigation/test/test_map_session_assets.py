@@ -401,3 +401,18 @@ def test_refuses_output_over_source_capture(tmp_path):
     with pytest.raises(ValueError, match='must not overwrite'):
         prepare_map_session(pointer, source, geometry)
     assert {path: path.read_bytes() for path in source.iterdir() if path.is_file()} == before
+
+
+def test_operator_water_station_tolerance_survives_runtime_generation(tmp_path):
+    pointer = _write_fixture(tmp_path)[0]
+    source = tmp_path / 'capture/water_station.yaml'
+    station = yaml.safe_load(source.read_text())
+    station['lateral_tolerance_m'] = .01
+    source.write_text(yaml.safe_dump(station))
+    result = prepare_map_session(pointer)
+    runtime = Path(result['runtime_directory'])
+    profiles = json.loads((runtime/'station_profiles.json').read_text())
+    registry = load_registry(runtime/'service_destinations.yaml')
+    assert profiles['stations']['water_station']['lateral_tolerance_m'] == .01
+    assert registry['tables'][0]['service_poses'][0]['lateral_tolerance_m'] == .01
+    assert registry['tables'][0]['service_poses'][0]['target_front_gap_m'] == .01

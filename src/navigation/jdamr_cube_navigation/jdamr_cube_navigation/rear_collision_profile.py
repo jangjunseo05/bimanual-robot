@@ -212,6 +212,43 @@ def _is_target_face_point(point, target):
             and lower_m <= tangent_m <= upper_m)
 
 
+def _point_inside_outline(point, outline):
+    """Return whether point is strictly inside a possibly stepped outline."""
+    x_m, y_m = point
+    inside = False
+    previous = outline[-1]
+    for current in outline:
+        ax, ay = previous
+        bx, by = current
+        dx, dy = bx - ax, by - ay
+        length2 = dx * dx + dy * dy
+        fraction = 0.0 if length2 == 0.0 else max(
+            0.0, min(1.0, ((x_m - ax) * dx + (y_m - ay) * dy) / length2))
+        if math.hypot(
+                x_m - ax - fraction * dx,
+                y_m - ay - fraction * dy) <= 1e-9:
+            return False
+        if ((ay > y_m) != (by > y_m)
+                and x_m < (bx - ax) * (y_m - ay) / (by - ay) + ax):
+            inside = not inside
+        previous = current
+    return inside
+
+
+def _impossible_turned_memory_projection(point, source, chassis_outline):
+    """Identify an old external return now projected inside the physical chassis."""
+    try:
+        source_pose, _scan, source_point, current_pose = source
+        heading_change = abs(math.atan2(
+            math.sin(current_pose[2] - source_pose[2]),
+            math.cos(current_pose[2] - source_pose[2])))
+    except (IndexError, TypeError, ValueError):
+        return False
+    return (heading_change > math.radians(5.0)
+            and not _point_inside_outline(source_point, chassis_outline)
+            and _point_inside_outline(point, chassis_outline))
+
+
 class _RearCollisionWatch:
     """Callable direct-motion guard with a scoped fine-target exception."""
 
@@ -231,6 +268,19 @@ class _RearCollisionWatch:
         self._state['target'] = _target_context(
             observation, target_gap_m, current_gap_m, source_point_filter)
         self._state['filtered_memory_key'] = None
+
+    def set_rear_extent(self, rear_extent_m):
+        """Use the measured rear edge only for fresh terminal reverse targets."""
+        outline = self._state['outline']
+        padded_extent = -min(point[0] for point in outline)
+        if (isinstance(rear_extent_m, bool)
+                or not isinstance(rear_extent_m, (int, float))
+                or not math.isfinite(rear_extent_m)
+                or rear_extent_m <= 0.0
+                or not -1e-9 <= padded_extent - rear_extent_m <= .005 + 1e-9):
+            raise ValueError('rear docking footprint differs from measured rear edge')
+        self._state['terminal_outline'] = tuple(
+            (max(x, -rear_extent_m), y) for x, y in outline)
 
     def clear_target(self):
         self._state['target'] = None
@@ -266,6 +316,17 @@ def _watch(node, command, state, linear_decel_mps2, angular_decel_radps2):
     if (not all(math.isfinite(value) for value in (receive_age_s, ros_age_s))
             or not 0.0 <= receive_age_s <= SCAN_MAX_AGE_S
             or not 0.0 <= ros_age_s <= SCAN_MAX_AGE_S):
+        last_emit_s = state.get('last_scan_latency_emit_s', -math.inf)
+        if now_s - last_emit_s >= 1.0:
+            try:
+                node.emit(
+                    'rear_scan_latency_breakdown',
+                    receive_age_s=receive_age_s, ros_age_s=ros_age_s,
+                    scan_input_timing=dict(
+                        getattr(node, 'scan_input_timing', None) or {}))
+                state['last_scan_latency_emit_s'] = now_s
+            except (AttributeError, TypeError, ValueError, RuntimeError):
+                pass
         return f'{scan_context} scan stale or future-dated'
     if scan.header.frame_id != state['frame_id']:
         return f'{collision_context} scan frame changed'
@@ -275,6 +336,8 @@ def _watch(node, command, state, linear_decel_mps2, angular_decel_radps2):
         try:
             state['memory'] = tuple(node._remembered_blind_points(state['laser'], scan))
             state['memory_sources'] = tuple(getattr(node, '_blind_point_sources', ()))
+            state['memory_diagnostics'] = tuple(
+                getattr(node, '_blind_point_diagnostics', ()))
         except (AttributeError, RuntimeError, ValueError):
             return f'{collision_context} blind-range memory unavailable'
         state['scan_key'] = scan_key
@@ -290,8 +353,19 @@ def _watch(node, command, state, linear_decel_mps2, angular_decel_radps2):
         live_points = scan_points(scan, state['laser'])
         remembered_points = state['memory']
         remembered_sources = state.get('memory_sources', ())
+        remembered_diagnostics = state.get('memory_diagnostics', ())
+        if len(remembered_diagnostics) != len(remembered_points):
+            remembered_diagnostics = (None,) * len(remembered_points)
         target = state.get('target')
+        outline = state['outline']
         if _may_ignore_target(command, target, stamp_s):
+            # Nav2's polygon embeds 5 mm beyond the measured chassis. At the
+            # final centimetre use its actual rear edge, without deleting any
+            # obstacle returns or changing the wheel/side/front envelope.
+            if (command.linear.x < 0.0
+                    and target['current_gap_m'] <= .03
+                    and 'terminal_outline' in state):
+                outline = state['terminal_outline']
             live_points = [point for point in live_points
                            if not _is_target_face_point(point, target)]
             source_filter = target.get('source_point_filter')
@@ -299,26 +373,72 @@ def _watch(node, command, state, linear_decel_mps2, angular_decel_radps2):
             if state['filtered_memory_key'] != filtered_memory_key:
                 filtered_memory = remembered_points
                 filtered_sources = remembered_sources
+                filtered_diagnostics = remembered_diagnostics
                 if callable(source_filter):
-                    filtered_memory = tuple(node._remembered_blind_points(
-                        state['laser'], scan,
-                        source_point_filter=lambda pose, source_scan, point: not
-                        source_filter(pose, source_scan, point)))
-                    filtered_sources = tuple(getattr(node, '_blind_point_sources', ()))
+                    if len(remembered_sources) == len(remembered_points):
+                        kept = []
+                        for point, source, diagnostic in zip(
+                                remembered_points, remembered_sources,
+                                remembered_diagnostics):
+                            pose, source_scan, source_point, _current_pose = source
+                            if not source_filter(pose, source_scan, source_point):
+                                kept.append((point, source, diagnostic))
+                        filtered_memory = tuple(
+                            point for point, _source, _diagnostic in kept)
+                        filtered_sources = tuple(
+                            source for _point, source, _diagnostic in kept)
+                        filtered_diagnostics = tuple(
+                            diagnostic for _point, _source, diagnostic in kept)
+                    else:
+                        # Older/custom providers may not expose provenance. Preserve
+                        # fail-closed behavior by recomputing instead of dropping an
+                        # unverified remembered obstacle.
+                        filtered_memory = tuple(node._remembered_blind_points(
+                            state['laser'], scan,
+                            source_point_filter=lambda pose, source_scan, point: not
+                            source_filter(pose, source_scan, point)))
+                        filtered_sources = tuple(
+                            getattr(node, '_blind_point_sources', ()))
+                        filtered_diagnostics = tuple(
+                            getattr(node, '_blind_point_diagnostics', ()))
                 state['filtered_memory'] = filtered_memory
                 state['filtered_sources'] = filtered_sources
+                state['filtered_diagnostics'] = filtered_diagnostics
                 state['filtered_memory_key'] = filtered_memory_key
             remembered_points = state['filtered_memory']
             remembered_sources = state['filtered_sources']
+            remembered_diagnostics = state['filtered_diagnostics']
+            if len(remembered_diagnostics) != len(remembered_points):
+                remembered_diagnostics = (None,) * len(remembered_points)
+            # A return acquired outside the chassis before a substantial turn
+            # can be projected inside the measured body by accumulated odometry
+            # error. It cannot describe a collision that the next reverse step
+            # will newly create. Drop only that provenance-backed impossible
+            # projection; live returns and every point outside the physical
+            # chassis continue through the swept-footprint guard.
+            if ('terminal_outline' in state
+                    and len(remembered_sources) == len(remembered_points)):
+                kept = [
+                    (point, source, diagnostic)
+                    for point, source, diagnostic in zip(
+                        remembered_points, remembered_sources,
+                        remembered_diagnostics)
+                    if not _impossible_turned_memory_projection(
+                        point, source, state['terminal_outline'])
+                ]
+                remembered_points = tuple(item[0] for item in kept)
+                remembered_sources = tuple(item[1] for item in kept)
+                remembered_diagnostics = tuple(item[2] for item in kept)
         points = [*live_points, *remembered_points]
         poses = _prediction_poses(linear_mps, angular_radps, horizon_s)
         witness = {}
         if path_sweep_hit(
-                points, state['outline'], poses, push_tolerance_m=0.0, witness=witness):
+                points, outline, poses, push_tolerance_m=0.0, witness=witness):
             if not state['collision_active']:
                 live_hit = witness['point_index'] < len(live_points)
                 source = 'live_scan' if live_hit else 'remembered_blind_point'
                 origin = None
+                clearance_diagnostic = None
                 index = witness['point_index'] - len(live_points)
                 if not live_hit and 0 <= index < len(remembered_sources):
                     pose, source_scan, point, current_pose = remembered_sources[index]
@@ -333,10 +453,13 @@ def _watch(node, command, state, linear_decel_mps2, angular_decel_radps2):
                         'ranges': [float(r) if math.isfinite(r) else None
                                    for r in source_scan.ranges],
                     }
+                    if index < len(remembered_diagnostics):
+                        clearance_diagnostic = remembered_diagnostics[index]
                 node.emit(
                     'rear_collision_witness', source=source,
                     point_base_xy_m=witness['point_base_xy_m'], scan_stamp_s=stamp_s,
                     remembered_source=origin,
+                    remembered_clearance_diagnostic=clearance_diagnostic,
                     live_point_count=len(live_points),
                     remembered_point_count=len(remembered_points),
                     target_face_filter_active=target is not None,
@@ -345,7 +468,7 @@ def _watch(node, command, state, linear_decel_mps2, angular_decel_radps2):
                     inside_initial_outline=witness.get('inside_initial_outline'),
                     collision_pose_base_xyyaw=witness.get('collision_pose_base_xyyaw'),
                     initial_boundary_distance_m=witness.get('initial_boundary_distance_m'),
-                    footprint_base_xy_m=state['outline'],
+                    footprint_base_xy_m=outline,
                     prediction_horizon_s=horizon_s,
                     effective_linear_mps=linear_mps,
                     effective_angular_radps=angular_radps)
@@ -379,9 +502,11 @@ def _motion_collision_watch(node, snapshot, *, rotation=False):
         'laser': tuple(laser), 'outline': tuple(tuple(point) for point in outline),
         'memory': tuple(memory), 'frame_id': scan.header.frame_id,
         'memory_sources': tuple(getattr(node, '_blind_point_sources', ())),
+        'memory_diagnostics': tuple(getattr(node, '_blind_point_diagnostics', ())),
         'scan_key': (id(scan), _stamp_s(scan)),
         'target': None,
-        'filtered_memory': (), 'filtered_memory_key': None,
+        'filtered_memory': (), 'filtered_sources': (), 'filtered_diagnostics': (),
+        'filtered_memory_key': None,
         'collision_active': False,
     }
     if rotation:

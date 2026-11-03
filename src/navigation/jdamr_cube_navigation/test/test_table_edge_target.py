@@ -332,3 +332,60 @@ def test_november_corner_recheck_uses_right_left_order_and_normal_distance():
                (data['front_extent_m'], data['corner_spacing_m']/2)]
     predicted = [sum((p[i]-corrected_center[i])*corrected_normal[i] for i in (0,1)) for p in corners]
     assert predicted == pytest.approx([data['external_right_gap_m'], data['external_left_gap_m']],abs=1e-9)
+
+
+def test_live_tape_plane_compensates_rgb_exposure_translation_and_yaw():
+    import numpy as np
+    from jdamr_cube_navigation.table_edge_target import table_tape_surface_at_rgb
+    mounted = mount()
+    depth_pose, rgb_pose = (1., 2., .3), (1.05, 1.98, .34)
+    observed = observation(mounted)
+    result = table_tape_surface_at_rgb(
+        observed, mounted, depth_pose, rgb_pose, 10.1, 10.2)
+    rotation = np.array(result['R_base_from_optical'])
+    point = rotation @ np.array(result['plane_point_optical_m'])
+    point += np.array([-.275, 0., 1.])
+    c, s = math.cos(rgb_pose[2]), math.sin(rgb_pose[2])
+    world = np.array([[c, -s, 0.], [s, c, 0.], [0., 0., 1.]]) @ point
+    world[:2] += rgb_pose[:2]
+    assert world[2] == pytest.approx(.75)
+    # The carried plane still contains the original measured tabletop.
+    assert (rotation @ np.array(result['plane_normal_optical'])) == pytest.approx(
+        [0., 0., 1.], abs=1e-8)
+    assert result['source'] == 'live_depth_table_plane'
+    assert result['stamp_s'] == 10.
+    assert result['rgb_stamp_s'] == 10.1
+
+
+@pytest.mark.parametrize('stamp,now', [(9.6, 10.2), (10.3, 10.2)])
+def test_live_tape_plane_rejects_mismatched_or_future_rgb(stamp, now):
+    from jdamr_cube_navigation.table_edge_target import table_tape_surface_at_rgb
+    with pytest.raises(ValueError, match='exposure mismatch'):
+        table_tape_surface_at_rgb(observation(), mount(), (0.,0.,0.),
+                                  (0.,0.,0.), stamp, now)
+
+
+def test_live_tape_plane_does_not_consume_predicted_tracking_geometry():
+    from jdamr_cube_navigation.table_edge_target import table_tape_surface_at_rgb
+    observed = observation()
+    observed.update(detected=False, stable=False, reason='predicted')
+    with pytest.raises(ValueError, match='stable detected'):
+        table_tape_surface_at_rgb(observed, mount(), (0.,0.,0.),
+                                  (0.,0.,0.), 10.1, 10.2)
+
+
+def test_live_tabletop_without_visible_front_edge_is_enough_for_tape_projection():
+    from jdamr_cube_navigation.table_edge_target import table_tape_surface_at_rgb
+    original = observation()
+    point = [sum(end[i] for end in original['edge_endpoints_optical_m']) / 2
+             for i in range(3)]
+    doc = {'stamp_s': 10., 'detected': False, 'stable': False,
+           'reason': 'no_table_edge_candidate', 'tabletop_plane': {
+               'source': 'current_depth_tabletop_fit',
+               'plane_normal_optical': original['plane_normal'],
+               'plane_point_optical_m': point,
+               'plane_rms_m': .002, 'table_height_m': .75, 'inlier_count': 500}}
+    surface = table_tape_surface_at_rgb(doc, mount(), (0.,0.,0.),
+                                        (0.,0.,0.), 10.1, 10.2)
+    assert surface['source'] == 'live_depth_table_plane'
+    assert surface['plane_point_optical_m'] == pytest.approx(point)

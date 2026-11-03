@@ -4,18 +4,18 @@ margin_m: 0.005
 self_boxes:
 - name: rear_left_column_returns
   center_xy_m:
-  - 0.241
-  - -0.23
+  - 0.242
+  - -0.2295
   size_xy_m:
-  - 0.018
-  - 0.026
+  - 0.02
+  - 0.027
 - name: rear_right_column_returns
   center_xy_m:
   - 0.273
-  - 0.2
+  - 0.2015
   size_xy_m:
   - 0.024
-  - 0.024
+  - 0.027
 provenance:
   date: '2026-10-12'
   operator_evidence: 주변 장애물이 없고 높인 네 기둥이 라이다 평면을 지난다고 사용자 확인
@@ -55,3 +55,84 @@ provenance:
     range_membership_changed: false
     reason: preserve empirically identified self-return membership when laser extrinsics
       are calibrated
+  rear_right_boundary_update:
+    date: '2026-11-03'
+    unit: m
+    valid_for: current laser_link and assembled rear-right column returns
+    previous_center_xy_m:
+    - 0.273
+    - 0.2
+    previous_size_xy_m:
+    - 0.024
+    - 0.024
+    filtered_y_bounds_before_m:
+    - 0.183
+    - 0.217
+    filtered_y_bounds_after_m:
+    - 0.183
+    - 0.22
+    operator_evidence: 사용자가 오른쪽 뒤 차단점 위치에 외부 장애물이 없음을 확인하고 해당 점 제외 요청
+    measurement: 서로 다른 도크 복귀 3회 차단점이 같은 차체 좌표 부근에 유지. 기존 기둥 필터의 raw laser +y 경계 바로
+      밖
+    body_xy_samples_m:
+    - - -0.263734
+      - -0.233392
+    - - -0.265265
+      - -0.233571
+    - - -0.265008
+      - -0.234222
+    laser_pose_base_xyyaw:
+    - -0.01
+    - 0.0
+    - 3.20297955
+    sources:
+    - runtime/runs/water_station_20261103_132632_d21db485/cycle_events.jsonl
+    - runtime/runs/water_station_20261103_133002_2ec543ee/cycle_events.jsonl
+    - runtime/runs/table_01_20261103_134600_db79f08d/cycle_events.jsonl
+    physical_classification: existing column return continuation inferred; no new
+      chassis dimension claimed
+    scope: 기존 오른쪽 기둥 필터의 +y 경계만 3mm 확장. x 경계와 -y 경계 유지; 원거리 및 다른 방위 반사 보존
+  rear_left_boundary_update:
+    date: '2026-11-03'
+    unit: m
+    valid_for: current laser_link and operator-confirmed rear-left chassis returns
+    previous_center_xy_m:
+    - 0.241
+    - -0.23
+    previous_size_xy_m:
+    - 0.018
+    - 0.026
+    filtered_bounds_before_m:
+      x:
+      - 0.227
+      - 0.255
+      y:
+      - -0.248
+      - -0.212
+    filtered_bounds_after_m:
+      x:
+      - 0.227
+      - 0.257
+      y:
+      - -0.248
+      - -0.211
+    operator_evidence: 사용자가 왼쪽 뒤 차단점을 차체 반사로 확인하고 해당 점 제외 요청
+    measurement: 2회 도킹의 live 차단점 33개. 기존 x 상한 밖 최대 약1.01mm 및 y 상한 밖 약0.22mm
+    laser_pose_base_xyyaw:
+    - -0.01
+    - 0.0
+    - 3.20297955
+    body_xy_samples_m:
+    - - -0.26276410975021214
+      - 0.19664783300005528
+    - - -0.27969071045154925
+      - 0.2147544512206903
+    - - -0.27958654716544196
+      - 0.21608641400028689
+    sources:
+    - runtime/runs/table_01_20261103_135222_81170b37/cycle_events.jsonl
+    - runtime/runs/water_station_20261103_135711_dbd6588c/cycle_events.jsonl
+    physical_classification: operator-confirmed chassis return; return ROI is not
+      measured chassis dimensions
+    scope: 기존 왼쪽 기둥 반사 필터 +x 경계2mm·+y 경계1mm 확장. -x/-y 유지. 원본 약0.79m 거리의 별도 기억점은 제외하지
+      않음

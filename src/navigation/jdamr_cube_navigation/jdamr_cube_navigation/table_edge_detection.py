@@ -296,18 +296,25 @@ def _visible_front_edge(
 
 def detect_table_edge(
         depth_mm: np.ndarray, intrinsics: CameraIntrinsics,
-        config: TableEdgeConfig) -> TableEdgeDetection | None:
+        config: TableEdgeConfig, *,
+        plane_result: dict | None = None) -> TableEdgeDetection | None:
     """Detect a table front edge using only its visible horizontal top."""
+    if plane_result is not None:
+        plane_result.clear()
     _validate_table_config(config)
     points_optical, columns, rows = depth_points(
         depth_mm, intrinsics, config)
     return _detect_table_edge_points(
-        depth_mm, intrinsics, config, points_optical, columns, rows)
+        depth_mm, intrinsics, config, points_optical, columns, rows,
+        plane_result=plane_result)
 
 
 def _detect_table_edge_points(depth_mm, intrinsics, config,
-                              points_optical, columns, rows):
+                              points_optical, columns, rows,
+                              plane_result=None):
     """Fit one component while retaining the original background evidence."""
+    if plane_result is not None:
+        plane_result.clear()
     if len(points_optical) < config.minimum_inliers:
         return None
 
@@ -333,6 +340,26 @@ def _detect_table_edge_points(depth_mm, intrinsics, config,
     if not _horizontal_plane_is_valid(refined_normal, refined, config):
         return None
 
+    plane_rms_m = float(np.sqrt(np.mean(distances[plane_mask] ** 2)))
+    normal_optical = rotation.T @ refined_normal
+    normal_optical /= np.linalg.norm(normal_optical)
+    plane_centroid_level = np.mean(refined, axis=0)
+    plane_centroid_optical = plane_centroid_level @ rotation
+    table_height_m = (
+        config.camera_height_m + float(plane_centroid_level[2]))
+    if plane_result is not None:
+        plane_result.update({
+            'source': 'current_depth_tabletop_fit',
+            'plane_normal_optical': [
+                float(value) for value in normal_optical],
+            'plane_point_optical_m': [
+                float(value) for value in plane_centroid_optical],
+            'plane_rms_m': plane_rms_m,
+            'inlier_count': int(len(refined)),
+            'candidate_count': int(len(points_optical)),
+            'table_height_m': table_height_m,
+        })
+
     edge = _visible_front_edge(
         depth_mm, points_optical, points_level, columns, rows, plane_mask,
         config, intrinsics, rotation, refined_normal, refined_offset)
@@ -342,11 +369,8 @@ def _detect_table_edge_points(depth_mm, intrinsics, config,
     edge_center = np.mean(endpoints_optical, axis=0)
     edge_vector = endpoints_optical[1] - endpoints_optical[0]
     edge_length_m = float(np.linalg.norm(edge_vector))
-    plane_rms_m = float(np.sqrt(np.mean(distances[plane_mask] ** 2)))
     edge_center_level = edge_center @ rotation.T
     table_height_m = config.camera_height_m + float(edge_center_level[2])
-    normal_optical = rotation.T @ refined_normal
-    normal_optical /= np.linalg.norm(normal_optical)
     edge_angle_rad = math.atan2(float(edge_vector[2]), float(edge_vector[0]))
     inlier_ratio = len(refined) / len(points_optical)
     residual_quality = max(

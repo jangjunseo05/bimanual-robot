@@ -1,12 +1,14 @@
 """Verify bounded table transit and face-based parking without hardware."""
 
 import contextlib
+from collections import deque
 from copy import deepcopy
 import inspect
 import json
 import math
 from pathlib import Path
 import time
+from threading import Lock
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -77,6 +79,7 @@ def mission(monkeypatch):
     target = {'x_m': 0.885, 'y_m': 0.0, 'yaw_rad': 0.0,
               'face_center_map_xy_m': (1.0, 0.0), 'outward_normal_map_xy': (-1.0, 0.0)}
     node.observe_target = Mock(return_value=target)
+    node._set_observer_perception = Mock(return_value=True)
     return node
 
 
@@ -87,6 +90,21 @@ def invoke(node, execute=True, *, search=False):
                       'wheel_outer_width': {'value': 0.540}},
         'table_01', (1, 0), 0.6, execute=execute,
         candidate_trial=execute, search=search)
+
+
+def test_visit_enables_depth_perception_only_after_transit(mission):
+    assert invoke(mission)
+
+    assert mission._set_observer_perception.call_args_list == [
+        ((False,), {}), ((True,), {})]
+
+
+def test_visit_keeps_transit_when_unneeded_depth_perception_cannot_disable(mission):
+    mission._set_observer_perception.side_effect = [False, True]
+
+    assert invoke(mission)
+
+    assert mission.execute.called
 
 
 @pytest.mark.parametrize('entrypoint', ['visit', 'observation'])
@@ -596,12 +614,210 @@ def test_search_does_not_rotate_for_sensor_or_geometry_failure(mission):
     mission.observe_target.side_effect = (
         box_service.BoxObservationUnavailable(
             'LiDAR scan is stale or future-dated', retryable=False))
-    with pytest.raises(RuntimeError, match='LiDAR scan is stale'):
+    mission._wait_for_observation_input = Mock(return_value=(False, 'operator_link_lost'))
+    with pytest.raises(RuntimeError, match='operator_link_lost'):
         invoke(mission, search=True)
     mission.search_rotation.assert_not_called()
     failure = [call for call in mission.emit.call_args_list
                if call.args == ('box_observation_failed',)][0]
     assert failure.kwargs['retryable'] is False
+
+
+def test_temporary_observation_input_waits_without_search_then_reobserves(mission):
+    target = mission.observe_target.return_value
+    error = box_service.BoxObservationUnavailable(
+        'no_stable_box', retryable=False, latency_limited=True,
+        latency_reasons={'observer_silent'})
+    mission.observe_target.side_effect = [error, target, target]
+    mission._wait_for_observation_input = Mock(return_value=(True, None))
+
+    assert invoke(mission, search=True)
+
+    assert mission._wait_for_observation_input.call_args.args[0] is error
+    mission.search_rotation.assert_not_called()
+    assert any(call.args == ('box_observation_input_recovered',)
+               for call in mission.emit.call_args_list)
+
+
+@pytest.mark.parametrize('reason', [
+    'stale_or_future_depth',
+    'camera_info_missing',
+    'LiDAR scan is stale or future-dated',
+    'fresh LiDAR scan is required for box witness',
+])
+def test_depth_and_scan_input_gaps_are_temporary(mission, reason):
+    error = box_service.BoxObservationUnavailable(reason, retryable=False)
+
+    assert mission._temporary_observation_input_gap(error) is True
+
+
+def test_temporary_tf_input_waits_without_search_then_reobserves(mission):
+    target = mission.observe_target.return_value
+    error = RuntimeError(
+        'stationary teaching unavailable: need fresh TF, odometry and localization')
+    mission.observe_target.side_effect = [error, target, target]
+    mission._input_gap_recoverable = Mock(return_value=True)
+    mission._wait_for_observation_input = Mock(return_value=(True, None))
+
+    assert invoke(mission, search=True)
+
+    assert mission._wait_for_observation_input.call_args.args[0] is error
+    mission.search_rotation.assert_not_called()
+
+
+@pytest.mark.parametrize('reason', [
+    'LiDAR and depth face normals disagree',
+    'LiDAR scan frame must be measured laser_link',
+    'observed_box_outside_selected_table_region',
+])
+def test_geometry_and_calibration_observation_failures_never_wait(mission, reason):
+    error = box_service.BoxObservationUnavailable(reason, retryable=True)
+    mission.observe_target.side_effect = error
+    mission._wait_for_observation_input = Mock(
+        side_effect=AssertionError('non-input failure waited'))
+
+    with pytest.raises(box_service.BoxObservationUnavailable):
+        invoke(mission)
+
+    mission._wait_for_observation_input.assert_not_called()
+
+
+def _observation_wait_node():
+    node = object.__new__(BoxServiceRoute)
+    node.stop_requested = False
+    node._input_recovery_paused = False
+    node.run_deadline_s = 20.0
+    node.box_status_received_s = None
+    node.samples = {}
+    node.depth_camera_info_received_s = None
+    node.depth_camera_info = None
+    node.box_status = None
+    node.last_scan = None
+    node.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=10_000_000_000))
+    node._operator_link_ready = Mock(return_value=True)
+    node._departure_battery_ready = Mock(return_value=True)
+    node._guard_failure = Mock(return_value=None)
+    node.readiness_failure_reason = Mock(return_value='battery_guard')
+    node._input_gap_recoverable = Mock(return_value=False)
+    node._escape_publisher = Mock(return_value=Mock())
+    return node
+
+
+def test_observation_input_wait_holds_zero_and_preserves_global_deadline(monkeypatch):
+    node = _observation_wait_node()
+    clock = [10.0]
+
+    monkeypatch.setattr(box_service.time, 'monotonic', lambda: clock[0])
+
+    def deliver(_node, timeout_sec):
+        clock[0] += timeout_sec
+        node.depth_camera_info_received_s = clock[0]
+        node.depth_camera_info = SimpleNamespace(
+            header=SimpleNamespace(stamp=_stamp(10.0)))
+
+    monkeypatch.setattr(box_service, 'spin_node', deliver)
+    error = box_service.BoxObservationUnavailable(
+        'no_stable_box', retryable=False, latency_limited=True,
+        latency_reasons={'camera_info_missing'})
+
+    baseline = node._observation_input_snapshot()
+    assert node._wait_for_observation_input(error, baseline) == (True, None)
+    assert node.run_deadline_s == pytest.approx(20.05)
+    assert node._input_recovery_paused is False
+    command = node._escape_publisher.return_value.publish.call_args.args[0]
+    assert command.linear.x == 0.0 and command.angular.z == 0.0
+
+
+def test_camera_gap_ignores_unrelated_scan_updates_until_fresh_camera_info(monkeypatch):
+    node = _observation_wait_node()
+    clock = [10.0]
+    spins = [0]
+    baseline = node._observation_input_snapshot()
+
+    monkeypatch.setattr(box_service.time, 'monotonic', lambda: clock[0])
+
+    def deliver(_node, timeout_sec):
+        spins[0] += 1
+        clock[0] += timeout_sec
+        node.samples['scan'] = clock[0]
+        if spins[0] == 4:
+            node.depth_camera_info_received_s = clock[0]
+            node.depth_camera_info = SimpleNamespace(
+                header=SimpleNamespace(stamp=_stamp(10.0)))
+
+    monkeypatch.setattr(box_service, 'spin_node', deliver)
+    error = box_service.BoxObservationUnavailable(
+        'no_stable_box', retryable=False, latency_limited=True,
+        latency_reasons={'camera_info_missing'})
+
+    assert node._wait_for_observation_input(error, baseline) == (True, None)
+    assert spins[0] == 4
+    assert node.run_deadline_s == pytest.approx(20.2)
+
+
+def test_observation_wait_sees_input_delivered_after_attempt_before_wait(monkeypatch):
+    node = _observation_wait_node()
+    clock = [10.0]
+    baseline = node._observation_input_snapshot()
+    node.depth_camera_info_received_s = 10.01
+    node.depth_camera_info = SimpleNamespace(
+        header=SimpleNamespace(stamp=_stamp(10.0)))
+    monkeypatch.setattr(box_service.time, 'monotonic', lambda: clock[0])
+    spin = Mock(side_effect=AssertionError('fresh one-shot input was missed'))
+    monkeypatch.setattr(box_service, 'spin_node', spin)
+    error = box_service.BoxObservationUnavailable(
+        'no_stable_box', retryable=False, latency_limited=True,
+        latency_reasons={'camera_info_missing'})
+
+    assert node._wait_for_observation_input(error, baseline) == (True, None)
+    spin.assert_not_called()
+    node._escape_publisher.return_value.publish.assert_called_once()
+
+
+def test_mixed_guard_and_observer_gap_recovers_after_fresh_observer(monkeypatch):
+    node = _observation_wait_node()
+    clock = [10.0]
+    baseline = node._observation_input_snapshot()
+    monkeypatch.setattr(box_service.time, 'monotonic', lambda: clock[0])
+
+    def deliver(_node, timeout_sec):
+        clock[0] += timeout_sec
+        node.box_status_received_s = clock[0]
+        node.box_status = {'stamp_s': 10.0, 'reason': 'no_box_surface_candidate'}
+
+    monkeypatch.setattr(box_service, 'spin_node', deliver)
+    error = box_service.BoxObservationUnavailable(
+        'no_stable_box', retryable=False, latency_limited=True,
+        latency_reasons={'input_gap', 'observer_silent'})
+
+    assert node._wait_for_observation_input(error, baseline) == (True, None)
+    assert node.run_deadline_s == pytest.approx(20.05)
+
+
+@pytest.mark.parametrize('failure_kind, expected', [
+    ('stop', 'operator_stop'),
+    ('link', 'operator_link_lost'),
+    ('battery', 'battery_guard'),
+    ('guard', 'AMCL covariance high'),
+])
+def test_observation_input_wait_keeps_safety_stops_terminal(failure_kind, expected):
+    node = _observation_wait_node()
+    if failure_kind == 'stop':
+        node.stop_requested = True
+    elif failure_kind == 'link':
+        node._operator_link_ready.return_value = False
+    elif failure_kind == 'battery':
+        node._departure_battery_ready.return_value = False
+    else:
+        node._guard_failure.return_value = expected
+    error = box_service.BoxObservationUnavailable(
+        'LiDAR scan is stale or future-dated', retryable=False)
+
+    baseline = node._observation_input_snapshot()
+    assert node._wait_for_observation_input(error, baseline) == (False, expected)
+    assert node.run_deadline_s == 20.0
+    assert node._input_recovery_paused is False
 
 
 def test_final_approach_observation_loss_never_rotates_near_box(mission):
@@ -1021,6 +1237,36 @@ def _observer_node(monkeypatch, *, scan=True, observation_stamp=10.1):
             'provenance': 'LIDAR_DEPTH_FACE_AGREEMENT_NOT_EXTERNAL_ACCURACY',
         }))
     return node
+
+
+def test_observe_target_preserves_global_deadline_during_initial_input_recovery(
+        monkeypatch):
+    node = _observer_node(monkeypatch)
+    clock = [20.0]
+    node.run_deadline_s = 21.0
+    node._input_recovery_paused = False
+    node._navigation_ready.side_effect = [False] + [True] * 10
+    node._guard_failure.return_value = 'scan stale: age=1.000s limit=0.500s'
+    node._input_gap_recoverable = Mock(return_value=True)
+
+    def recover(_reason):
+        assert node._input_recovery_paused is True
+        clock[0] += 2.0
+        node.box_status['stamp_s'] = 12.1
+        node.last_scan.header.stamp = _stamp(12.1)
+        return True
+
+    node._wait_for_input_recovery = Mock(side_effect=recover)
+    ros_clock = iter((10.0, 12.2))
+    node.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=int(next(ros_clock) * 1e9)))
+    monkeypatch.setattr(box_service.time, 'monotonic', lambda: clock[0])
+
+    target = node.observe_target({}, 0.065, 0.05, (0.5, 0.0), 0.6)
+
+    assert target['candidate_trial'] is True
+    assert node.run_deadline_s == pytest.approx(23.0)
+    assert node._input_recovery_paused is False
 
 
 def test_lidar_witness_rejection_records_replayable_scan_once(monkeypatch):
@@ -1551,6 +1797,7 @@ def _search(node):
 def test_t20_latency_reobserve(mission, case):
     """Re-observe one latency-limited window in place; never after a stop."""
     target = mission.observe_target.return_value
+    mission._temporary_observation_input_gap = Mock(return_value=False)
     if case == 'ok':
         mission.observe_target.side_effect = [_latency_limited(), target]
         try:
@@ -2180,6 +2427,62 @@ class _ParameterClientStub:
         self.requests.append([(p.name, p.value) for p in parameters])
         return SetParametersAtomically.Response(result=SetParametersResult(
             successful=self.successful, reason='' if self.successful else 'rejected'))
+
+
+def test_observer_perception_gate_changes_only_once_and_clears_cached_status():
+    node = object.__new__(BoxServiceRoute)
+    node.emit = Mock()
+    node._wait = lambda future, timeout_s: future
+    node.observer_parameters = _ParameterClientStub()
+    node._observer_perception_enabled = None
+    node.box_status = {'detected': True, 'stamp_s': 10.}
+    node.box_status_received_s = 10.
+    node.box_status_history = deque([(10., node.box_status)], maxlen=16)
+
+    assert node._set_observer_perception(False)
+    assert node._set_observer_perception(False)
+
+    assert len(node.observer_parameters.requests) == 1
+    assert dict(node.observer_parameters.requests[0]) == {'perception_enabled': False}
+    assert node.box_status is None
+    assert node.box_status_received_s is None
+    assert list(node.box_status_history) == []
+
+
+def test_observer_perception_enable_discards_gate_status_until_fresh_depth():
+    node = object.__new__(BoxServiceRoute)
+    node.emit = Mock()
+    node._wait = lambda future, timeout_s: future
+    node.observer_parameters = _ParameterClientStub()
+    node._observer_perception_enabled = False
+    node.box_status = None
+    node.box_status_received_s = None
+    node.box_status_history = deque(maxlen=16)
+
+    assert node._set_observer_perception(True)
+    node._box_callback(SimpleNamespace(data=json.dumps({
+        'reason': 'perception_enabled_waiting_for_depth', 'stamp_s': 11.})))
+    assert node.box_status is None
+    node._box_callback(SimpleNamespace(data=json.dumps({
+        'reason': 'stable_detection', 'detected': True, 'stamp_s': 11.1})))
+    assert node.box_status['stamp_s'] == 11.1
+
+
+def test_failed_observer_disable_still_invalidates_local_cached_status():
+    node = object.__new__(BoxServiceRoute)
+    node.emit = Mock()
+    node._wait = lambda future, timeout_s: future
+    node.observer_parameters = _ParameterClientStub(successful=False)
+    node._observer_perception_enabled = None
+    node.box_status = {'detected': True, 'stamp_s': 10.}
+    node.box_status_received_s = 10.
+    node.box_status_history = deque([(10., node.box_status)], maxlen=16)
+
+    assert not node._set_observer_perception(False)
+
+    assert node.box_status is None
+    assert node.box_status_received_s is None
+    assert list(node.box_status_history) == []
 
 
 def test_pointcloud_mode_passes_the_selected_region_and_complete_mount_revision():
@@ -3410,6 +3713,7 @@ def test_recovered_depth_history_does_not_block_fresh_table_occlusion():
 
 def _moving_table_route(monkeypatch):
     node = object.__new__(BoxServiceRoute)
+    node._station_reference_lock = Lock()
     monkeypatch.setattr(box_service, 'spin_node', Mock())
     clock = [10.0]
     mount = {'camera_mount': {
@@ -3766,6 +4070,101 @@ def test_visible_selected_table_does_not_add_a_map_only_approach(monkeypatch, ca
     assert check.called is (case != 'visible')
 
 
+@pytest.mark.parametrize('case', ['ready', 'single', 'missing', 'stale', 'spread',
+                                  'yaw_spread', 'stop'])
+def test_tape_entry_uses_only_coherent_fresh_pair_before_approach(case):
+    node = object.__new__(BoxServiceRoute)
+    node.station_reference = SimpleNamespace(observation_method='table_front_tape')
+    node.station_reference_profile = {'lateral_tolerance_m': .01}
+    node.parking_contract = {'yaw_tolerance_rad': math.radians(3.)}
+    node.stop_requested = case == 'stop'
+    node.run_deadline_s = 0.
+    node._operator_link_ready = Mock(return_value=True)
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=10**10))
+    goal = {'valid': True, 'goal_odom': [1., .30, 0.], 'stamp_s': 9.9,
+            'goal_filter_sample_count': 3, 'goal_filter_xy_spread_m': .002,
+            'goal_filter_yaw_spread_rad': .005}
+    if case == 'single':
+        goal['goal_filter_sample_count'] = 1
+    elif case == 'stale':
+        goal['stamp_s'] = 8.
+    elif case == 'spread':
+        goal['goal_filter_xy_spread_m'] = .08
+    elif case == 'yaw_spread':
+        goal['goal_filter_yaw_spread_rad'] = .10
+    node._station_goal_reference = Mock(return_value=(goal, {'valid': case != 'missing'}))
+    anchored = {'tape_anchor': True}
+    node._station_anchor_target = Mock(return_value=anchored)
+    node.emit = Mock()
+    target = {'map_anchor': True}
+    if case == 'stop':
+        with pytest.raises(RuntimeError, match='operator_stop'):
+            node._prepare_table_tape_entry(target)
+    else:
+        assert node._prepare_table_tape_entry(target) is (anchored if case == 'ready' else target)
+        node._station_goal_reference.assert_called_with(continuous_rebase=True)
+    assert node._station_anchor_target.called is (case == 'ready')
+
+
+@pytest.mark.parametrize('offset_m, restage', [(.005, False), (.30, True), (-.30, True)])
+def test_wide_tape_entry_selects_restage_before_close_approach(offset_m, restage):
+    node = object.__new__(BoxServiceRoute)
+    node.station_reference = SimpleNamespace(observation_method='table_front_tape')
+    node.station_reference_mode = 'rgbd'
+    node.station_reference_profile = {'lateral_tolerance_m': .01}
+    node.station_reference_goal = {'goal_filter_sample_count': 3}
+    node._station_reference_enabled = Mock(return_value=True)
+    node._final_gap_m = Mock(return_value=.01)
+    node.box_front_half_width_m = .225
+    target = {'observation_robot_pose_map': [.435, -offset_m, 0.],
+              'face_center_map_xy_m': [1., 0.], 'outward_normal_map_xy': [-1., 0.],
+              'x_m': .485, 'y_m': 0., 'yaw_rad': 0., 'rgbd_reference_valid': True}
+    reason, lateral = node._table_lateral_restage_reason(target, .065)
+    assert (reason is not None) is restage
+    assert lateral == pytest.approx(offset_m)
+
+
+@pytest.mark.parametrize('tape, raises', [(True, False), (False, False), (True, True)])
+def test_tape_observation_checker_is_scoped_and_restored(tape, raises):
+    node = object.__new__(BoxServiceRoute)
+    node.surface_mode = 'table_edge'
+    node.station_reference = SimpleNamespace(
+        observation_method='table_front_tape' if tape else 'surface_only')
+    original = '/test/behavior_trees/navigate_through_poses_transit_rpp.xml'
+    node.through_behavior_tree = original
+    node.waypoints = []
+    node.emit = Mock()
+    selected = []
+    def execute(**_kwargs):
+        selected.append(Path(node.through_behavior_tree).name)
+        if raises:
+            raise RuntimeError('navigation interrupted')
+        return True
+    node.execute = execute
+    if raises:
+        with pytest.raises(RuntimeError, match='navigation interrupted'):
+            node._execute_table_observation_transit()
+    else:
+        assert node._execute_table_observation_transit()
+    assert selected == [('navigate_through_poses_table_observation_rpp.xml' if tape
+                         else 'navigate_through_poses_transit_rpp.xml')]
+    assert node.through_behavior_tree == original
+
+
+def test_tape_view_corrects_heading_before_advancing(monkeypatch):
+    node, _ = _table_view_node(monkeypatch, (1., -1.817, .2))
+    node.station_reference = SimpleNamespace(observation_method='table_front_tape')
+    node.capture_stationary_pose.side_effect = [((1., -1.817, .2), {}),
+                                                ((1., -1.817, 0.), {})]
+    calls = []
+    node.search_rotation = Mock(side_effect=lambda yaw: calls.append(('turn', yaw)) or True)
+    node._drive_zero_turn.side_effect = lambda distance, **_k: calls.append(('drive', distance)) or distance
+    assert node._advance_to_table_view()
+    assert calls[0][0] == 'turn'
+    assert calls[0][1] == pytest.approx(-.2)
+    assert calls[1][0] == 'drive'
+
+
 def test_moving_table_healthy_occlusion_keeps_same_odom_face(monkeypatch):
     node, clock, update, lookup = _moving_table_route(monkeypatch)
     valid = deepcopy(node.box_status)
@@ -4029,8 +4428,77 @@ def test_infeasible_lateral_reapproach_restages_sideways_before_approaching_agai
 
     node._zero_turn_final_approach.side_effect = approach
     assert node._table_fine_approach(dict(target), .065) == (True, 'to_odom')
-    assert order == ['approach', 'reverse', 'observe', 'restage', 'observe', 'approach']
+    assert order == ['approach', 'reverse', 'observe', 'restage', 'approach']
     assert node._restage_table_face_alignment.call_args.args[1:] == (.065, reason, .2)
+
+
+def _tape_restage_node(outcomes):
+    node = object.__new__(BoxServiceRoute)
+    node.station_reference = SimpleNamespace(observation_method='table_front_tape')
+    node.stop_requested = False
+    node._operator_link_ready = Mock(return_value=True)
+    node._table_rebase_requires_restage = False
+    node._table_observation_context = ({}, (1., 0.), .6)
+    node._final_gap_m = Mock(return_value=.01)
+    node.emit = Mock()
+    node._leave_parked_pose = Mock(return_value=True)
+    node.plan_pose = Mock(return_value={'ok': True})
+    node.execute = Mock(return_value=True)
+    node._table_restage_tape_goal = {'goal_odom': [.925, .1, 0.]}
+    node._table_restage_tape_target = Mock(side_effect=lambda target: target)
+    target = _table_edge_final_target(1.)
+    node.observe_target = Mock(side_effect=lambda *a: dict(target))
+    node._table_lateral_restage_reason = Mock(side_effect=outcomes)
+    return node, target
+
+
+@pytest.mark.parametrize('initial_latch', [False, True])
+def test_rebased_goal_latch_is_cleared_only_after_fresh_restage_preview(initial_latch):
+    node, target = _tape_restage_node([(None, .005)])
+    node._table_rebase_requires_restage = initial_latch
+    assert node._restage_table_face_alignment(target, .065, 'clearance', .1)
+    node._table_lateral_restage_reason.assert_called_once_with(
+        target, .065, honor_rebase_latch=False)
+    assert node._table_rebase_requires_restage is False
+    node.execute.assert_called_once_with(final_parking=False, alignment=True, face=False)
+    assert node._leave_parked_pose.call_count == 1
+
+
+def test_carried_goal_residual_is_corrected_before_near_approach():
+    node, target = _tape_restage_node([
+        ('table lateral alignment requires more clearance', -.09859664981649491),
+        (None, .005)])
+    assert node._restage_table_face_alignment(target, .065, 'clearance', .15)
+    assert node.execute.call_count == 2
+    assert node._leave_parked_pose.call_count == 2
+    assert node._table_lateral_restages == 1
+    correction = next(call for call in node.emit.call_args_list
+                      if call.args[0] == 'table_lateral_restage_correction')
+    assert correction.kwargs['near_surface_approach_started'] is False
+    assert correction.kwargs['lateral_offset_m'] == pytest.approx(-.0985966498)
+    assert node._table_rebase_requires_restage is False
+
+
+def test_rebased_goal_latch_remains_when_fresh_restage_preview_fails():
+    reason = 'table lateral alignment requires more clearance'
+    node, target = _tape_restage_node([(reason, .1), (reason, .1)])
+    node._table_rebase_requires_restage = True
+    assert not node._restage_table_face_alignment(target, .065, 'clearance', .1)
+    assert node._table_rebase_requires_restage is True
+    assert node.execute.call_count == 2
+    assert node.emit.call_args.kwargs['reason'] == 'table_lateral_restage_not_confirmed'
+
+
+def test_restage_stop_does_not_start_a_correction():
+    node, target = _tape_restage_node([
+        ('table lateral alignment requires more clearance', .1)])
+    def stopped(**kwargs):
+        node.stop_requested = True
+        return True
+    node.execute.side_effect = stopped
+    assert not node._restage_table_face_alignment(target, .065, 'clearance', .1)
+    assert node.execute.call_count == 1
+    node._table_lateral_restage_reason.assert_not_called()
 
 
 def test_lateral_restage_is_bounded_per_visit():
@@ -4043,6 +4511,11 @@ def test_lateral_restage_is_bounded_per_visit():
 
 def test_lateral_restage_uses_the_face_alignment_leg_from_turning_room():
     node = object.__new__(BoxServiceRoute)
+    node.stop_requested = False
+    node._operator_link_ready = Mock(return_value=True)
+    node._table_observation_context = ({}, (1., 0.), .6)
+    node._final_gap_m = Mock(return_value=.01)
+    node.observe_target = Mock(return_value=_table_edge_final_target(1.))
     node.emit = Mock()
     order = []
     node._leave_parked_pose = Mock(side_effect=lambda **k: order.append(('escape', k)) or True)
@@ -4051,7 +4524,8 @@ def test_lateral_restage_uses_the_face_alignment_leg_from_turning_room():
     node.execute = Mock(side_effect=lambda **k: order.append(('execute', k)) or True)
     target = {**_table_edge_final_target(1.0), 'face_center_map_xy_m': (1.0, .2)}
     assert node._restage_table_face_alignment(target, .065, 'reason', .2)
-    assert order[0] == ('escape', {'clearance_m': box_service.ESCAPE_CLEARANCE_M})
+    assert order[0] == ('escape', {'clearance_m': box_service.ESCAPE_CLEARANCE_M,
+                                  'max_face_angle_rad': box_service.FINAL_TRIM_MAX_RAD})
     planned = order[1][1]
     assert planned['id'] == 'face_alignment'
     assert planned['x_m'] == pytest.approx(1.0 - .065 - box_service.FACE_ALIGNMENT_FRONT_GAP_M)
@@ -4061,6 +4535,35 @@ def test_lateral_restage_uses_the_face_alignment_leg_from_turning_room():
     assert node.last_box_face == {'face_center_map_xy_m': [1.0, .2],
                                   'outward_normal_map_xy': [-1.0, 0.0]}
     assert node._table_lateral_restages == 1
+
+
+def test_initial_tape_restage_preserves_the_reported_plan_failure(mission):
+    mission.surface_mode = 'table_edge'
+    mission.final_gap_override_m = .01
+    mission.station_reference = SimpleNamespace(observation_method='table_front_tape')
+    mission._start_station_reference_perception = Mock()
+    box_service.load_route('route')['waypoints'][-1].update(x=.5, y=.1)
+    observed = {'x_m': .485, 'y_m': 0., 'yaw_rad': 0.,
+                'face_center_map_xy_m': (1., 0.), 'outward_normal_map_xy': (-1., 0.),
+                'observation_robot_pose_map': [.5, .1, 0.]}
+    mission.observe_target = Mock(return_value=observed)
+    mission._prepare_table_tape_entry = Mock(side_effect=lambda target: target)
+    mission.capture_stationary_pose.side_effect = [((.5, .1, 0.), {})]
+    mission._table_lateral_restage_reason = Mock(return_value=('clearance', .1))
+    mission._table_restage_unavailable = Mock(return_value=None)
+
+    def cannot_plan(*_args):
+        mission.emit('failed', reason='table_lateral_restage_unplanned')
+        return False
+
+    mission._restage_table_face_alignment = Mock(side_effect=cannot_plan)
+    assert not mission.visit_observed_box(
+        'route', {}, {'front_to_wheel_axis': {'value': .065},
+                      'wheel_outer_width': {'value': .540}},
+        'water_station', (1., 0.), .6, execute=True, candidate_trial=True,
+        resume_at_observation=True)
+    assert mission.emit.call_args.kwargs['reason'] == 'table_lateral_restage_unplanned'
+    mission.execute.assert_not_called()
 
 
 @pytest.mark.parametrize('offset_m, restaged', [(.20, True), (.02, False)])
@@ -4090,7 +4593,8 @@ def test_surface_only_table_restages_a_large_lateral_offset_before_the_straight_
     assert ('table_alignment_transit_skipped' in events) is (not restaged)
     if restaged:
         mission._leave_parked_pose.assert_called_once_with(
-            clearance_m=box_service.ESCAPE_CLEARANCE_M)
+            clearance_m=box_service.ESCAPE_CLEARANCE_M,
+            max_face_angle_rad=box_service.FINAL_TRIM_MAX_RAD)
         mission.execute.assert_called_once_with(
             final_parking=False, alignment=True, face=True)
         assert mission.plan_pose.call_args_list[0].args[0]['y_m'] == 0.0
@@ -4131,14 +4635,16 @@ def test_far_observation_uses_the_normal_alignment_leg_without_a_counted_restage
     assert mission._table_lateral_restages == 0
 
 
-def test_restage_that_its_escape_would_refuse_keeps_the_continuous_approach(mission):
-    # 20 deg off the face normal and inside turning room: the straight escape
-    # refuses this heading, so the earlier continuous approach is kept.
+def test_oblique_table_restage_does_not_skip_required_lateral_alignment(mission):
+    # The approach accepts up to 30 degrees; its clearance escape must accept
+    # that same heading rather than falling back to an infeasible approach.
     events = _surface_only_visit(mission, (.5, .2, math.radians(20.)))
-    assert 'table_lateral_restage_unavailable' in events
-    assert 'table_alignment_transit_skipped' in events
-    mission._leave_parked_pose.assert_not_called()
-    mission.execute.assert_not_called()
+    assert 'table_lateral_restage_unavailable' not in events
+    assert 'table_lateral_restage' in events
+    mission._leave_parked_pose.assert_called_once_with(
+        clearance_m=box_service.ESCAPE_CLEARANCE_M,
+        max_face_angle_rad=box_service.FINAL_TRIM_MAX_RAD)
+    mission.execute.assert_called_once_with(final_parking=False, alignment=True, face=True)
 
 
 @pytest.mark.parametrize('lateral_m, feasible', [(.02, True), (.20, False)])
@@ -4155,6 +4661,55 @@ def test_lateral_restage_reason_uses_the_live_controller_preview(lateral_m, feas
     reason, offset_m = node._table_lateral_restage_reason(target, .065)
     assert offset_m == pytest.approx(lateral_m)
     assert (reason is None) is feasible
+
+
+@pytest.mark.parametrize(('lateral_m', 'goal_matches', 'expected_reason'), [
+    (.039, True, None),
+    (.20, True, 'table approach preview heading out of range'),
+    (.039, False, 'carried_tape_goal_changed'),
+])
+def test_carried_tape_restage_requires_same_goal_and_feasible_continuous_preview(
+        lateral_m, goal_matches, expected_reason):
+    node = object.__new__(BoxServiceRoute)
+    node.station_reference = Mock()
+    node.station_reference_mode = 'rgbd'
+    node.station_reference_profile = {'lateral_tolerance_m': .005}
+    node.box_front_half_width_m = .225
+    node._final_gap_m = Mock(return_value=.01)
+    target = {'x_m': .925, 'y_m': lateral_m, 'yaw_rad': 0.,
+              'face_center_map_xy_m': (1., 0.), 'outward_normal_map_xy': (-1., 0.),
+              'observation_robot_pose_map': [.5, 0., 0.]}
+    held = {'goal_odom': [target['x_m'], target['y_m'], target['yaw_rad']]}
+    node._table_restage_tape_goal = held
+    node.station_reference_goal = dict(held)
+    node.station_reference_control_goal = dict(held)
+    if not goal_matches:
+        node.station_reference_control_goal['goal_odom'] = [.925, lateral_m + .01, 0.]
+    node._table_restage_tape_target = Mock(return_value=target)
+
+    reason, offset_m = node._table_lateral_restage_reason(target, .065)
+
+    assert offset_m == pytest.approx(lateral_m)
+    assert reason == expected_reason
+
+
+def test_lateral_restage_reason_honors_a_rebased_goal_latch():
+    node = object.__new__(BoxServiceRoute)
+    node.station_reference = Mock()
+    node.station_reference_mode = 'rgbd'
+    node.station_reference_profile = {'lateral_tolerance_m': .005}
+    node.box_front_half_width_m = .225
+    node._final_gap_m = Mock(return_value=.01)
+    node._table_restage_tape_goal = None
+    node._table_rebase_requires_restage = True
+    target = {'x_m': .925, 'y_m': .002, 'yaw_rad': 0.,
+              'face_center_map_xy_m': (1., 0.), 'outward_normal_map_xy': (-1., 0.),
+              'observation_robot_pose_map': [.5, 0., 0.]}
+
+    reason, offset_m = node._table_lateral_restage_reason(target, .065)
+
+    assert reason == 'rebased_station_goal_requires_restage'
+    assert offset_m == pytest.approx(.002)
 
 
 def test_surface_only_face_target_uses_the_registered_lateral_position():
@@ -4270,3 +4825,188 @@ def test_accepted_tape_goal_latches_in_near_band_when_pair_leaves_view(monkeypat
     update((.44,0.,0.))
     assert node._station_terminal_goal['goal_odom'] == goal['goal_odom']
     assert node._continuous_table_stop['basis'] == 'aligned_face_frozen_for_precision_band'
+
+
+@pytest.mark.parametrize('angle_deg', [15.77, -20.0, 30.0])
+def test_oblique_restage_reverse_reaches_projected_clearance(angle_deg):
+    node = object.__new__(BoxServiceRoute)
+    angle = math.radians(angle_deg)
+    node.last_box_face = {'face_center_map_xy_m': [0.0, 0.0],
+                          'outward_normal_map_xy': [-1.0, 0.0]}
+    node._parking_parameters_ready = Mock(return_value=True)
+    node._reverse_smoother_ready = Mock(return_value=True)
+    node.capture_stationary_pose = Mock(return_value=((-0.45, 0.0, angle), {}))
+    node.emit = Mock()
+    node.config = {'waypoints': []}
+    node.waypoints = []
+    node._make_reverse_path = Mock(return_value=RosPath())
+    node._reverse_path_valid = Mock(return_value=False)
+    # The normal escape retains its 15-degree guard.
+    assert not node._leave_parked_pose()
+    node._make_reverse_path.assert_not_called()
+    # A restage may plan this reverse, but cannot bypass collision validation.
+    assert not node._leave_parked_pose(max_face_angle_rad=box_service.FINAL_TRIM_MAX_RAD)
+    start, target = node._make_reverse_path.call_args.args
+    assert target[0] == pytest.approx(-box_service.ESCAPE_CLEARANCE_M)
+    assert target[2] == angle
+    assert target[1] == pytest.approx(-(.565-.45)*math.tan(angle))
+    node._reverse_path_valid.assert_called_once()
+    assert node.emit.call_args.kwargs['reason'] == 'box_escape_blocked'
+
+
+@pytest.mark.parametrize('blocked', [False, True])
+def test_coherent_rebase_checks_forward_path_before_reversing(monkeypatch, blocked):
+    node, _clock, update, _lookup = _moving_table_route(monkeypatch)
+    node.station_reference = SimpleNamespace(observation_method='table_front_tape')
+    node.station_reference_profile = {'lateral_tolerance_m': .005}
+    node.parking_contract['yaw_tolerance_rad'] = .03
+    node._station_reference_lock = Lock()
+    goal = {'valid': True, 'goal_odom': [.455, .027, 0.], 'stamp_s': 10.1,
+            'goal_filter_sample_count': 3}
+    node.station_reference_goal = goal
+    node._station_goal_reference = Mock(return_value=(goal, goal))
+    node._table_rebase_requires_restage = True
+    validator = node._table_approach_validator.return_value
+    if blocked:
+        validator.side_effect = RuntimeError('table lateral alignment requires more clearance')
+        with pytest.raises(RuntimeError, match='requires more clearance'):
+            update((.2, 0., 0.))
+        assert node._table_rebase_requires_restage
+    else:
+        result = update((.2, 0., 0.))
+        assert result['lateral_error_m'] == pytest.approx(.027)
+        assert not node._table_rebase_requires_restage
+    assert validator.call_args.kwargs['lateral_goal_odom'] == tuple(goal['goal_odom'])
+    assert validator.call_args.args[0] == (.2, 0., 0.)
+
+
+def test_tape_acquisition_does_not_steer_to_opposite_map_lateral_goal(monkeypatch):
+    node, _clock, update, _lookup = _moving_table_route(monkeypatch)
+    node.parking_contract['yaw_tolerance_rad'] = .03
+    node.station_reference = SimpleNamespace(observation_method='table_front_tape')
+    node.station_reference_mode = 'rgbd'
+    node.station_reference_profile = {'lateral_tolerance_m': .005}
+    # Recorded 40 cm failure: map fallback asks for the opposite-side correction.
+    node.station_reference_taught_map_pose = (.5, -.028, 0.)
+    node.station_reference_goal = None
+    node._station_goal_reference = Mock(return_value=(None, {
+        'valid': False, 'reason': 'station_reference_not_observed'}))
+    control = update((.2, 0., 0.))
+    assert control['lateral_error_m'] == pytest.approx(0.)
+    assert node._continuous_table_stop['lateral_reference_valid'] is False
+    assert getattr(node, '_station_terminal_goal', None) is None
+    node._station_goal_reference.return_value = (
+        {'valid': True, 'goal_odom': [.5,.014,0.], 'stamp_s': 10.2},
+        {'valid': True, 'stamp_s': 10.2})
+    control = update((.21,0.,0.))
+    assert control['lateral_error_m'] == pytest.approx(.014)
+    node._station_goal_reference.assert_called_with(freeze=False, continuous_rebase=True)
+    assert node.station_reference_goal_frozen is False
+
+
+def test_far_tape_goal_is_ignored_and_reset_once_at_thirty_cm(monkeypatch):
+    from collections import deque
+    node, clock, update, _lookup = _moving_table_route(monkeypatch)
+    node.station_reference = SimpleNamespace(observation_method='table_front_tape')
+    node.station_reference_profile = {'lateral_tolerance_m': .01}
+    node.parking_contract['yaw_tolerance_rad'] = .03
+    node._station_reference_lock = Lock()
+    node._station_reference_pending = None
+    far = {'valid': True, 'goal_odom': [.5, -.028, 0.], 'stamp_s': 10.1,
+           'goal_filter_sample_count': 3}
+    node.station_reference_goal = far
+    node.station_reference_goal_frozen = True
+    node._station_terminal_goal = dict(far)
+    node._station_reference_goal_samples = deque([far])
+    node._station_goal_reference = Mock(return_value=(far,far))
+    far_control = update((.1,0.,0.))  # beyond the 30 cm alignment band
+    assert far_control['lateral_error_m'] == pytest.approx(0.)
+    node._station_goal_reference.assert_not_called()
+    node._station_goal_reference.return_value = (None, {'valid': False})
+    close_control = update((.2,0.,0.))
+    assert close_control['lateral_error_m'] == pytest.approx(0.)
+    assert node.station_reference_goal is None
+    assert node._station_terminal_goal is None
+    assert not node._station_reference_goal_samples
+    assert node._station_reference_min_stamp_s == pytest.approx(10.2)
+    accepted = {'valid': True, 'goal_odom': [.5,.004,0.], 'stamp_s': 10.21}
+    node.station_reference_goal = accepted
+    node._station_goal_reference.return_value = (accepted,accepted)
+    update((.21,0.,0.))
+    assert node.station_reference_goal is accepted  # no per-tick clearing
+
+
+def _close_tape_node(samples):
+    node = object.__new__(BoxServiceRoute)
+    node.get_clock = lambda: SimpleNamespace(now=lambda: SimpleNamespace(nanoseconds=10_000_000_000))
+    node._station_reference_lock = Lock()
+    node._station_reference_goal_samples = deque(samples, maxlen=5)
+    node._station_reference_pending = None
+    node.station_reference_result = None
+    node.station_reference_goal = {'goal_odom': [1., .2, 0.]}
+    node._station_terminal_goal = dict(node.station_reference_goal)
+    return node
+
+
+def _close_tape_sample(stamp, x=.395, lateral=.004):
+    return {'valid': True, 'stamp_s': stamp, 'goal_odom': [.5, lateral, 0.],
+            'quality': {'tape_center_base_xy_m': [x, 0.]}}
+
+
+def test_close_entry_keeps_distinct_recent_near_samples_and_pending_frame():
+    samples = [_close_tape_sample(9.7), _close_tape_sample(9.8), _close_tape_sample(9.9)]
+    node = _close_tape_node(samples)
+    node.station_reference_result = samples[-1]  # duplicate frame is not a fourth sample
+    node._station_reference_pending = ('image', 'info', 9.95)
+    cutoff, count = node._start_table_tape_close_alignment(.065)
+    assert cutoff == 9.7 and count == 3
+    assert list(node._station_reference_goal_samples) == samples
+    assert node._station_reference_pending[2] == 9.95
+    assert node.station_reference_result is samples[-1]
+    assert node.station_reference_goal is None
+    assert node._station_terminal_goal is None
+
+
+def test_close_entry_drops_far_expired_and_unknown_range_samples():
+    node = _close_tape_node([
+        _close_tape_sample(9.1), _close_tape_sample(9.8, x=.6),
+        {'valid': True, 'stamp_s': 9.9, 'goal_odom': [.5, 0., 0.]}])
+    node._station_reference_pending = ('image', 'info', 9.9)
+    cutoff, count = node._start_table_tape_close_alignment(.065)
+    assert cutoff == 10. and count == 0
+    assert not node._station_reference_goal_samples
+    assert node._station_reference_pending is None
+
+
+def test_close_entry_keeps_unresolved_near_goal_contradiction():
+    node = _close_tape_node([_close_tape_sample(9.8), _close_tape_sample(9.9)])
+    node._station_reference_goal_challenged = True
+    node._station_reference_goal_correction_pending = True
+    cutoff, count = node._start_table_tape_close_alignment(.065)
+    assert count == 2 and cutoff == 9.8
+    assert node._station_reference_goal_challenged is True
+    assert node._station_reference_goal_correction_pending is True
+    assert node.station_reference_goal is None  # two frames do not authorize a goal
+
+
+def test_identical_depth_geometry_reuses_preview_but_changed_geometry_rechecks(monkeypatch):
+    node, clock, update, _lookup = _moving_table_route(monkeypatch)
+    validate = node._table_approach_validator.return_value
+    control = update((.2, 0., 0.))
+    control['validate_control']((.2, 0., 0.), 0.)
+    assert validate.call_count == 1
+    clock[0] = 10.21
+    node.box_status['stamp_s'] = 10.11
+    control = update((.2, 0., 0.))
+    control['validate_control']((.2, 0., 0.), 0.)
+    assert validate.call_count == 1
+    # Even a small plane change is a different geometry, not timestamp-only reuse.
+    node.box_status['stamp_s'] = 10.12
+    for point in node.box_status['edge_endpoints_optical_m']:
+        point[2] += .001
+    control = update((.2, 0., 0.))
+    control['validate_control']((.2, 0., 0.), 0.)
+    assert validate.call_count == 2
+    clock[0] = 11.
+    with pytest.raises(RuntimeError, match='stale|silent'):
+        update((.2, 0., 0.))

@@ -434,21 +434,58 @@ class RearBoxFaceTracker:
     """Require a stable relative line across consecutive stopped scans."""
 
     def __init__(self, required_frames=8, maximum_offset_spread_m=0.03,
-                 maximum_angle_spread_deg=3.0):
+                 maximum_angle_spread_deg=3.0, max_missing_frames=0):
         if (isinstance(required_frames, bool)
                 or not isinstance(required_frames, int)
                 or required_frames <= 0):
             raise ValueError('required_frames must be a positive integer')
+        if (isinstance(max_missing_frames, bool)
+                or not isinstance(max_missing_frames, int)
+                or max_missing_frames < 0):
+            raise ValueError('max_missing_frames must be a nonnegative integer')
         self.required_frames = required_frames
+        self.max_missing_frames = max_missing_frames
         self.maximum_offset_spread_m = _positive(
             maximum_offset_spread_m, 'maximum_offset_spread_m')
         self.maximum_angle_spread_rad = math.radians(_positive(
             maximum_angle_spread_deg, 'maximum_angle_spread_deg'))
         self._history = deque(maxlen=required_frames)
+        self._window = deque()
+        self._maximum_window_frames = required_frames + max_missing_frames
+        self._consecutive_missing_frames = 0
+
+    def reset(self):
+        self._history.clear()
+        self._window.clear()
+        self._consecutive_missing_frames = 0
+
+    def _discard_oldest_frame(self):
+        present = self._window.popleft()
+        if present:
+            self._history.popleft()
+
+    def _append_window_frame(self, present):
+        if len(self._window) == self._maximum_window_frames:
+            self._discard_oldest_frame()
+        self._window.append(present)
+
+    def _discard_oldest_face(self):
+        while self._window:
+            present = self._window.popleft()
+            if present:
+                self._history.popleft()
+                return
 
     def update(self, face):
         if face is None:
-            self._history.clear()
+            if not self._history:
+                self.reset()
+                return False
+            self._consecutive_missing_frames += 1
+            if self._consecutive_missing_frames > self.max_missing_frames:
+                self.reset()
+                return False
+            self._append_window_frame(False)
             return False
         if not isinstance(face, dict):
             raise ValueError('face must be a mapping')
@@ -466,6 +503,10 @@ class RearBoxFaceTracker:
         if normal[0] < 0.0:
             normal = -normal
             offset = -offset
+        self._consecutive_missing_frames = 0
+        if len(self._history) == self.required_frames:
+            self._discard_oldest_face()
+        self._append_window_frame(True)
         self._history.append((normal, tangent, offset))
         if len(self._history) < self.required_frames:
             return False
@@ -483,7 +524,7 @@ class RearBoxFaceTracker:
             and float(np.max(tangent_angles)) <= self.maximum_angle_spread_rad
         )
         if not stable:
-            self._history.popleft()
+            self._discard_oldest_face()
         return stable
 
     @property

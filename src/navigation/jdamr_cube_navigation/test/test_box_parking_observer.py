@@ -34,6 +34,57 @@ def test_depth_inputs_keep_only_latest_best_effort_sample():
     assert source.count('self._on_camera_info, LATEST_SENSOR_QOS') == 1
     assert source.count(
         'self._on_depth_with_watchdog_activity, LATEST_SENSOR_QOS') == 1
+    assert source.count(
+        "String, '/box_parking/perception_status', 1") == 1
+
+
+def test_predicted_late_depth_yields_once_for_latest_without_starvation():
+    node = object.__new__(DepthBoxParkingNode)
+    node._max_image_age_s = .5
+    node._minimum_period_s = .2
+    node._processing_duration_estimate_s = .18
+    node._freshness_skip_pending = False
+    node._precalculation_skips = 0
+
+    assert node._skip_for_fresher_depth(10.0, 10.25) is True
+    assert node._skip_for_fresher_depth(10.0, 10.25) is False
+    assert node._precalculation_skips == 1
+    assert node._freshness_skip_pending is False
+
+
+def test_predicted_late_depth_skips_before_decode_and_rate_limit():
+    _info, image = _messages(np.ones((2, 2), dtype='<u2'), stamp_s=10.0)
+    node = object.__new__(DepthBoxParkingNode)
+    node._perception_enabled = True
+    node._minimum_period_s, node._last_processed_s = 0.2, -math.inf
+    node._processing_duration_estimate_s = .18
+    node._freshness_skip_pending = False
+    node._precalculation_skips = 0
+    node._max_image_age_s = .5
+    node._camera_info_history = SimpleNamespace(
+        select=lambda *_a, **_k: pytest.fail('predicted-late input was decoded'))
+    node.get_clock = lambda: SimpleNamespace(
+        now=lambda: SimpleNamespace(nanoseconds=10_250_000_000))
+
+    node._on_depth(image)
+
+    assert node._last_processed_s == -math.inf
+    assert node._precalculation_skips == 1
+
+
+def test_measurement_reset_keeps_timing_prediction_and_skip_evidence():
+    node = object.__new__(DepthBoxParkingNode)
+    node._processing_duration_estimate_s = .3
+    node._freshness_skip_pending = True
+    node._precalculation_skips = 2
+    node._stability = SimpleNamespace(update=lambda _detection: None)
+    node._table_tracker = SimpleNamespace(reset=lambda: None)
+
+    node._reset_measurements()
+
+    assert node._processing_duration_estimate_s == .3
+    assert node._freshness_skip_pending is False
+    assert node._precalculation_skips == 2
 
 
 def test_long_depth_callback_does_not_trigger_silent_subscription_recovery(
@@ -53,6 +104,28 @@ def test_long_depth_callback_does_not_trigger_silent_subscription_recovery(
     node._on_depth_with_watchdog_activity(SimpleNamespace())
 
     assert node._last_depth_callback_s == 20.1
+    assert node._depth_callback_active is False
+
+
+def test_disabled_perception_keeps_watchdog_active_without_running_detection(monkeypatch):
+    """The executor can pause point-cloud work without making DDS look silent."""
+    node = object.__new__(DepthBoxParkingNode)
+    node._perception_enabled = False
+    node._last_processed_s = 7.0
+    node._last_depth_callback_s = 10.0
+    node._depth_callback_active = False
+    monotonic = iter((20.0,))
+    monkeypatch.setattr(
+        'jdamr_cube_navigation.depth_box_parking.time.monotonic',
+        lambda: next(monotonic))
+    monkeypatch.setattr(
+        'jdamr_cube_navigation.depth_box_parking.decode_depth_observation',
+        lambda *_a, **_kw: pytest.fail('disabled perception decoded depth'))
+
+    node._on_depth_with_watchdog_activity(SimpleNamespace())
+
+    assert node._last_processed_s == 7.0
+    assert node._last_depth_callback_s == 20.0
     assert node._depth_callback_active is False
 
 
@@ -371,8 +444,8 @@ def test_observer_declares_camera_mount_angles_for_front_detection():
         "('camera_pitch_rad', defaults.camera_pitch_rad)") == 1
 
 
-def test_age_includes_detection_processing_time(monkeypatch):
-    """A fast input must not hide a slow detector in published diagnostics."""
+def test_result_expiring_during_detection_is_rejected_with_latency_details(monkeypatch):
+    """A slow detector must not turn an expired frame into stable evidence."""
     info, image = _messages(np.ones((2, 2), dtype='<u2') * 1000)
     node = object.__new__(DepthBoxParkingNode)
     node._minimum_period_s, node._last_processed_s = 0.0, -math.inf
@@ -380,16 +453,25 @@ def test_age_includes_detection_processing_time(monkeypatch):
     node._optical_frame = OPTICAL_FRAME
     node._calibration_model, node._max_image_age_s = 'rectified_projection', .5
     node._surface_mode, node._config = 'front', BoxTopConfig()
-    node._stability = SimpleNamespace(update=lambda detection: False, frame_count=0)
+    stability_updates = []
+    node._stability = SimpleNamespace(
+        update=lambda detection: stability_updates.append(detection) or False,
+        frame_count=7)
     clock_ticks = iter((10_100_000_000, 10_700_000_000))
     node.get_clock = lambda: SimpleNamespace(
         now=lambda: SimpleNamespace(nanoseconds=next(clock_ticks)))
+    detection = SimpleNamespace(surface_kind='front')
     monkeypatch.setattr(
-        'jdamr_cube_navigation.depth_box_parking.detect_box_front', lambda *_: None)
+        'jdamr_cube_navigation.depth_box_parking.detect_box_front', lambda *_: detection)
     messages = []
     node._status = SimpleNamespace(publish=messages.append)
     node._on_depth(image)
     document = json.loads(messages[0].data)
+    assert stability_updates == [None]
+    assert document['reason'] == 'expired_during_processing'
+    assert document['detected'] is False
+    assert document['stable'] is False
+    assert document['stable_frame_count'] == 0
     assert document['input_age_s'] == pytest.approx(.1)
     assert document['age_s'] == pytest.approx(.7)
     assert document['processing_duration_s'] >= 0.
@@ -406,6 +488,7 @@ def test_publish_reports_previous_output_cost_without_hiding_current_phases(monk
     node = object.__new__(DepthBoxParkingNode)
     node._last_status_serialization_duration_s = .004
     node._last_status_publish_duration_s = .006
+    node._precalculation_skips = 2
     messages = []
     node._status = SimpleNamespace(publish=messages.append)
     ticks = iter((4., 5., 5.1, 5.2, 5.3))
@@ -420,10 +503,13 @@ def test_publish_reports_previous_output_cost_without_hiding_current_phases(monk
     assert document['calculation_duration_s'] == 1.
     assert document['postprocess_duration_s'] == 1.
     assert document['processing_duration_s'] == 3.
+    assert document['precalculation_skipped_frames'] == 2
     assert document['previous_status_serialization_duration_s'] == .004
     assert document['previous_status_publish_duration_s'] == .006
     assert node._last_status_serialization_duration_s == pytest.approx(.1)
     assert node._last_status_publish_duration_s == pytest.approx(.1)
+    assert node._processing_duration_estimate_s == 3.
+    assert node._precalculation_skips == 0
 
 
 def test_front_observation_publishes_optical_vertical_position(monkeypatch):
@@ -512,6 +598,26 @@ def test_unchanged_observer_parameters_preserve_accumulated_stability():
     assert not node.resets
     assert node._on_parameters(_parameters(camera_pitch_rad=.91)).successful
     assert node.resets == [None]
+
+
+def test_perception_gate_is_boolean_and_resets_accumulated_stability():
+    node = _surface_parameter_node()
+    messages = []
+    node._status = SimpleNamespace(publish=messages.append)
+
+    assert not node._on_parameters(_parameters(perception_enabled=0)).successful
+    assert node._on_parameters(_parameters(perception_enabled=False)).successful
+    assert node._perception_enabled is False
+    assert node.resets == [None]
+    assert json.loads(messages[-1].data)['reason'] == 'perception_disabled'
+
+    node.resets.clear()
+    assert node._on_parameters(_parameters(perception_enabled=False)).successful
+    assert not node.resets
+    assert node._on_parameters(_parameters(perception_enabled=True)).successful
+    assert node._perception_enabled is True
+    assert node.resets == [None]
+    assert json.loads(messages[-1].data)['reason'] == 'perception_enabled_waiting_for_depth'
 
 
 def test_table_mode_requires_height_and_updates_geometry_as_one_configuration():
@@ -630,8 +736,12 @@ def test_bad_height_does_not_partially_change_mode_or_camera_angles(height):
 def test_camera_reposition_and_return_to_box_clear_previous_stability():
     """Both mount changes and switching back discard prior evidence."""
     node = _surface_parameter_node()
+    node._processing_duration_estimate_s = .3
+    node._freshness_skip_pending = True
     assert node._on_parameters(_parameters(
         surface_mode='table_edge', camera_height_m=0.95, camera_pitch_rad=0.4)).successful
+    assert node._processing_duration_estimate_s is None
+    assert node._freshness_skip_pending is False
     assert node._on_parameters(_parameters(
         camera_height_m=1.1, camera_pitch_rad=0.6)).successful
     assert node._table_config.camera_height_m == 1.1
@@ -665,7 +775,7 @@ def test_table_edge_json_carries_endpoints_and_calibration_without_velocity(monk
         now=lambda: SimpleNamespace(nanoseconds=10_100_000_000))
     called = []
 
-    def detect(_depth, _intrinsics, config):
+    def detect(_depth, _intrinsics, config, *, plane_result=None):
         called.append(config)
         return detection
 
@@ -939,8 +1049,22 @@ def test_disabling_pointcloud_request_clears_selection_and_uses_legacy_detector(
     assert node._table_calibration_id == '' and node.resets
     legacy = object()
     monkeypatch.setattr('jdamr_cube_navigation.depth_box_parking.detect_table_edge',
-                        lambda *a: legacy)
+                        lambda *a, **kw: legacy)
     monkeypatch.setattr('jdamr_cube_navigation.depth_box_parking.detect_table_scene',
                         lambda *a: pytest.fail('disabled request used experimental detection'))
     result, fields, stable = node._table_observation(None, None, 10., OPTICAL_FRAME)
     assert result is legacy and fields == {} and stable is None
+
+
+def test_tabletop_plane_is_published_even_when_front_edge_is_occluded(monkeypatch):
+    node = object.__new__(DepthBoxParkingNode)
+    node._table_components = False
+    node._table_config = object()
+    measured = {'source': 'current_depth_tabletop_fit', 'inlier_count': 200}
+    def detect(_depth, _intrinsics, _config, *, plane_result):
+        plane_result.update(measured)
+        return None
+    monkeypatch.setattr('jdamr_cube_navigation.depth_box_parking.detect_table_edge', detect)
+    detection, fields, stable = node._table_observation(None, None, 10., OPTICAL_FRAME)
+    assert detection is None and stable is None
+    assert fields == {'tabletop_plane': measured}

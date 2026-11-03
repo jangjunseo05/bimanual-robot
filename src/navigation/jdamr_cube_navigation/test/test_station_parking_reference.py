@@ -28,6 +28,7 @@ def test_live_goal_filter_rejects_one_jump_without_waiting_for_initial_frames():
     assert filtered['goal_odom'][1] == pytest.approx(.031)
     assert filtered['goal_filter_sample_count'] == 3
     assert filtered['goal_filter_xy_spread_m'] == pytest.approx(.059)
+    assert filtered['goal_filter_yaw_spread_rad'] == 0.
 
 
 def test_live_goal_filter_handles_yaw_wrap_and_omits_incomplete_map_frame():
@@ -38,6 +39,7 @@ def test_live_goal_filter_handles_yaw_wrap_and_omits_incomplete_map_frame():
     ]
     filtered = station.filter_station_goal_observations(samples, .5)
     assert abs(abs(filtered['goal_odom'][2]) - math.pi) < 1e-9
+    assert filtered['goal_filter_yaw_spread_rad'] == pytest.approx(.01)
     assert 'goal_map' not in filtered
 
 

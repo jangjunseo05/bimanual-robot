@@ -113,8 +113,19 @@ def test_sensor_frame_columns_preserve_the_original_empirical_beam_mask():
     source = document['provenance']['coordinate_reframe']
     previous = load_boxes(json.dumps(source['previous_self_boxes']))
     current = load_boxes(json.dumps(document['self_boxes']))
+    update = document['provenance']['rear_right_boundary_update']
+    reframed_boxes = json.loads(json.dumps(document['self_boxes']))
+    right = next(box for box in reframed_boxes if box['name'] == 'rear_right_column_returns')
+    right['center_xy_m'] = update['previous_center_xy_m']
+    right['size_xy_m'] = update['previous_size_xy_m']
+    left_update = document['provenance']['rear_left_boundary_update']
+    left = next(box for box in reframed_boxes if box['name'] == 'rear_left_column_returns')
+    left['center_xy_m'] = left_update['previous_center_xy_m']
+    left['size_xy_m'] = left_update['previous_size_xy_m']
+    reframed = load_boxes(json.dumps(reframed_boxes))
     # A dense set of ray endpoints exercises both near ROI boundaries and
-    # distant returns; neither yaw calibration nor frame labels widen the ROI.
+    # distant returns. Frame conversion is exact; the later boundary correction
+    # may remove only points in its recorded extension.
     total = 0
     for radius in (.32, .33, .34, .35, 5.):
         ranges = np.full(72001, radius)
@@ -123,12 +134,24 @@ def test_sensor_frame_columns_preserve_the_original_empirical_beam_mask():
             old, old_count = filter_ranges(
                 ranges, angle_min, increment, (-.01, 0., math.pi),
                 previous, document['margin_m'])
-            new, new_count = filter_ranges(
+            same, same_count = filter_ranges(
                 ranges, angle_min, increment, (0., 0., 0.),
-                current, document['margin_m'])
+                reframed, document['margin_m'])
             total += old_count
-            assert old_count == new_count
-            np.testing.assert_array_equal(new, old)
+            assert old_count == same_count
+            np.testing.assert_array_equal(same, old)
+            new, _ = filter_ranges(ranges, angle_min, increment, (0., 0., 0.),
+                                   current, document['margin_m'])
+            assert np.all(np.isinf(new)[np.isinf(old)])
+            changed = np.isinf(new) & np.isfinite(old)
+            angles = angle_min + np.arange(len(ranges)) * increment
+            x, y = ranges * np.cos(angles), ranges * np.sin(angles)
+            right_extension = ((x >= .256) & (x <= .290)
+                               & (y > .217) & (y <= .220))
+            left_extension = ((x >= .227) & (x <= .257)
+                              & (y >= -.248) & (y <= -.211)
+                              & ((x > .255) | (y > -.212)))
+            assert np.all((right_extension | left_extension)[changed])
     assert total > 0
 
 

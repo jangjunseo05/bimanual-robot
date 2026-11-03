@@ -297,6 +297,31 @@ def test_logged_water_station_lateral_offset_reaches_precision_band():
                - .225 * abs(math.sin(heading - p[2])) > 0 for p in poses)
 
 
+@pytest.mark.parametrize(('remaining_m', 'heading_error_rad', 'lateral_error_m'), [
+    # mission_20261102_192956_dac49049 table_alignment_transit_skipped
+    (.28248187259350843, -.3162350320844097, .010362658669407773),
+    # mission_20261102_191252_65d8accb table_alignment_transit_skipped
+    (.2936478404024305, -.16447163408767784, .07210256520408),
+])
+def test_logged_alignment_transit_reaches_final_precision_band(
+        remaining_m, heading_error_rad, lateral_error_m):
+    yaw = -heading_error_rad
+    face_x = (remaining_m + .065) * math.cos(heading_error_rad) + .01
+    start = (0., -lateral_error_m, yaw)
+    goal = (face_x - .065 - .01, 0., 0.)
+
+    poses = face_approach_waypoints(
+        start, (face_x, 0.), (-1., 0.), .065, .225,
+        continuous_table=True, allow_near_alignment=True,
+        lateral_tracking=True, lateral_goal_odom=goal,
+        lateral_tolerance_m=.005,
+        max_lateral_heading_rad=math.radians(30.))
+
+    final = poses[-1]
+    assert abs(final[1]) <= .005
+    assert abs(final[2]) <= math.radians(.3)
+
+
 def test_logged_near_lateral_error_requests_clearance_instead_of_looping():
     start = (-0.08223210939063952, -0.09532518952372127, -0.030208263284322398)
     face = (0.003239895298168459, -0.11427502896258854)

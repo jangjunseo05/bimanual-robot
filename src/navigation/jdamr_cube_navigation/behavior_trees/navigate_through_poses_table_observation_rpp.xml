@@ -1,0 +1,21 @@
+<!-- Keep one transit path; finish its observation pose before tape acquisition. -->
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Sequence name="PlanOnceThenFollowTransitPath">
+      <RecoveryNode number_of_retries="60" name="ComputeTransitPathRetry">
+        <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="GridBased" error_code_id="{compute_path_error_code}" server_timeout="3000"/>
+        <Sequence name="WaitForTransitPlanner">
+          <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
+          <Wait wait_duration="1.0"/>
+        </Sequence>
+      </RecoveryNode>
+      <RecoveryNode number_of_retries="60" name="FollowTransitPathRetry">
+        <FollowPath path="{path}" controller_id="FollowPath" goal_checker_id="alignment_goal_checker" error_code_id="{follow_path_error_code}" server_timeout="3000"/>
+        <Sequence name="WaitForTransitController">
+          <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
+          <Wait wait_duration="1.0"/>
+        </Sequence>
+      </RecoveryNode>
+    </Sequence>
+  </BehaviorTree>
+</root>

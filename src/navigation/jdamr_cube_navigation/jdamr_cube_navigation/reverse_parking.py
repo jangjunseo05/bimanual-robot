@@ -32,6 +32,9 @@ REVERSE_CURVE_MIN_RADIUS_M = 0.3
 # contract speeds.
 SERVICE_TRANSIT_MAX_MPS = 0.12
 CACHED_CORRIDOR_SUPPORT_DIRECTIONS = 16
+# Inspect a point shortly before it reaches range_min. This matches the 5 cm
+# spatial keyframe interval while leaving room for the 2 cm free-ray margin.
+BLIND_CLEARANCE_LOOKAHEAD_M = 0.05
 RPP_PLUGIN = (
     'nav2_regulated_pure_pursuit_controller::'
     'RegulatedPurePursuitController')
@@ -281,8 +284,79 @@ def trail_retrace_points(current, trail, distance_m, max_gap_m, max_turn_rad,
     return points, length_m
 
 
+def _later_scan_clearance(point_odom, pose, scan, laser_pose):
+    """Return free-space proof plus a bounded explanation of a failed proof."""
+    base = to_base_frame(pose, (*point_odom, 0.0))
+    laser_point = to_base_frame(laser_pose, base)
+    distance = math.hypot(*laser_point[:2])
+    diagnostic = {'projected_distance_m': distance}
+    # Do not infer free space inside range_min, from absent returns, or along
+    # an occluding surface. Two centimetres separates the old hit from new rays.
+    margin_m = 0.02
+    if not scan.range_min + margin_m < distance < scan.range_max - margin_m:
+        diagnostic['reason'] = 'point_outside_provable_range'
+        return False, diagnostic
+    increment = scan.angle_increment
+    if not math.isfinite(increment) or increment == 0.0:
+        diagnostic['reason'] = 'scan_angle_increment_invalid'
+        return False, diagnostic
+    bearing = math.atan2(laser_point[1], laser_point[0])
+    # Cover both [-pi, pi] and [0, 2pi] scan conventions without wrapping
+    # a partial scan across its unobserved boundary.
+    for turn in (-2.0 * math.pi, 0.0, 2.0 * math.pi):
+        index = round((bearing + turn - scan.angle_min) / increment)
+        if 1 <= index < len(scan.ranges) - 1:
+            rays = scan.ranges[index - 1:index + 2]
+            diagnostic.update(
+                ray_index=index,
+                rays_m=[float(ray) if math.isfinite(ray) else None for ray in rays])
+            if all(math.isfinite(r) and distance + margin_m < r <= scan.range_max
+                   for r in rays):
+                diagnostic['reason'] = 'three_finite_rays_beyond_point'
+                return True, diagnostic
+            diagnostic['reason'] = 'three_finite_rays_not_beyond_point'
+            return False, diagnostic
+    diagnostic['reason'] = 'point_bearing_outside_scan'
+    return False, diagnostic
+
+
+def _later_scan_clears_point(point_odom, pose, scan, laser_pose):
+    """Require three finite rays beyond a formerly occupied, still visible point."""
+    return _later_scan_clearance(point_odom, pose, scan, laser_pose)[0]
+
+
+def _scan_stamp_s(scan):
+    """Return a finite LaserScan header stamp, or None for incomplete evidence."""
+    try:
+        stamp = scan.header.stamp
+        value = float(stamp.sec) + float(stamp.nanosec) * 1e-9
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _newer_same_frame_scan(source_scan, current_scan):
+    """Accept an explicit clearing scan only when its ordering and frame are proven."""
+    if current_scan is None:
+        return False
+    try:
+        source_frame = source_scan.header.frame_id
+        current_frame = current_scan.header.frame_id
+    except AttributeError:
+        return False
+    source_stamp = _scan_stamp_s(source_scan)
+    current_stamp = _scan_stamp_s(current_scan)
+    return (bool(source_frame) and current_frame == source_frame
+            and source_stamp is not None and current_stamp is not None
+            and current_stamp > source_stamp)
+
+
 def remembered_blind_points(keyframes, current_pose, laser_pose, blind_radius_m,
-                            source_point_filter=None, source_records=None):
+                            source_point_filter=None, source_records=None,
+                            current_scan=None, current_scan_pose=None,
+                            cleared_sources=None, clearance_failures=None,
+                            source_diagnostics=None,
+                            current_evidence_failure=None):
     """
     Return remembered returns that now lie inside the LiDAR blind range, base frame.
 
@@ -292,16 +366,35 @@ def remembered_blind_points(keyframes, current_pose, laser_pose, blind_radius_m,
     vanishes from the live scan; outside it the live scan decides.  An optional
     source_point_filter(pose, scan, point) selects points using the scan and pose
     that acquired them, before odometry drift changes their current projection.
+    current_scan and its stamped odom pose may contribute newer same-frame
+    free-space evidence. When a mutable cleared_sources set is supplied, that
+    evidence is retained by source scan and return index so a point cleared while
+    still visible cannot reappear after it enters the blind range. Entries are
+    pruned with their bounded keyframe source.
     """
     lx, ly, _lyaw = laser_pose
     found = []
-    for pose, scan in keyframes:
+    keyframes = list(keyframes)
+    active_scan_keys = {(id(frame), _scan_stamp_s(frame))
+                        for _pose, frame in keyframes}
+    if cleared_sources is not None:
+        cleared_sources.intersection_update(
+            key for key in cleared_sources if key[:2] in active_scan_keys)
+    if clearance_failures is not None:
+        for key in tuple(clearance_failures):
+            if key[:2] not in active_scan_keys:
+                clearance_failures.pop(key, None)
+    for frame_index, (pose, scan) in enumerate(keyframes):
         moved_m = math.dist(pose[:2], current_pose[:2])
         relative = to_base_frame(current_pose, pose)
         cos_yaw, sin_yaw = math.cos(relative[2]), math.sin(relative[2])
         # The laser itself moved at most moved_m plus its offset swung about the axle.
-        limit_m = blind_radius_m + moved_m + 2.0 * math.hypot(lx, ly)
-        for x_m, y_m in _base_points(scan, laser_pose):
+        limit_m = (blind_radius_m + BLIND_CLEARANCE_LOOKAHEAD_M + moved_m
+                   + 2.0 * math.hypot(lx, ly))
+        for point_index, (x_m, y_m) in enumerate(_base_points(scan, laser_pose)):
+            source_key = (id(scan), _scan_stamp_s(scan), point_index)
+            if cleared_sources is not None and source_key in cleared_sources:
+                continue
             if math.hypot(x_m - lx, y_m - ly) > limit_m:
                 continue
             if (source_point_filter is not None
@@ -309,10 +402,57 @@ def remembered_blind_points(keyframes, current_pose, laser_pose, blind_radius_m,
                 continue
             bx = relative[0] + cos_yaw * x_m - sin_yaw * y_m
             by = relative[1] + sin_yaw * x_m + cos_yaw * y_m
-            if math.hypot(bx - lx, by - ly) < blind_radius_m:
+            cosine, sine = math.cos(pose[2]), math.sin(pose[2])
+            point_odom = (pose[0] + cosine * x_m - sine * y_m,
+                          pose[1] + sine * x_m + cosine * y_m)
+            current_distance_m = math.hypot(bx - lx, by - ly)
+            inside_blind_range = current_distance_m < blind_radius_m
+            clearance_window = current_distance_m < (
+                blind_radius_m + BLIND_CLEARANCE_LOOKAHEAD_M)
+            explicitly_cleared = False
+            if clearance_window:
+                source_stamp_s = _scan_stamp_s(scan)
+                current_stamp_s = _scan_stamp_s(current_scan)
+                diagnostic = {
+                    'source_stamp_s': source_stamp_s,
+                    'current_stamp_s': current_stamp_s,
+                    'source_frame': getattr(getattr(scan, 'header', None), 'frame_id', None),
+                    'current_frame': getattr(
+                        getattr(current_scan, 'header', None), 'frame_id', None),
+                    'projected_distance_m': current_distance_m,
+                }
+                if current_scan_pose is None:
+                    diagnostic['reason'] = (
+                        current_evidence_failure or 'current_scan_pose_unavailable')
+                elif not _newer_same_frame_scan(scan, current_scan):
+                    diagnostic['reason'] = 'scan_not_newer_in_same_frame'
+                else:
+                    explicitly_cleared, evidence = _later_scan_clearance(
+                        point_odom, current_scan_pose, current_scan, laser_pose)
+                    diagnostic.update(evidence)
+                if clearance_failures is not None:
+                    if explicitly_cleared:
+                        clearance_failures.pop(source_key, None)
+                    elif (diagnostic.get('reason') != 'point_outside_provable_range'
+                          or source_key not in clearance_failures):
+                        clearance_failures[source_key] = diagnostic
+            historically_cleared = inside_blind_range and any(
+                _later_scan_clears_point(point_odom, later_pose, later_scan, laser_pose)
+                for later_pose, later_scan in keyframes[frame_index + 1:])
+            if explicitly_cleared or historically_cleared:
+                if clearance_failures is not None:
+                    clearance_failures.pop(source_key, None)
+                if explicitly_cleared and cleared_sources is not None:
+                    cleared_sources.add(source_key)
+                continue
+            if inside_blind_range:
                 found.append((bx, by))
                 if source_records is not None:
                     source_records.append((tuple(pose), scan, (x_m, y_m), tuple(current_pose)))
+                if source_diagnostics is not None:
+                    source_diagnostics.append(
+                        None if clearance_failures is None
+                        else clearance_failures.get(source_key))
     return found
 
 
@@ -1019,6 +1159,7 @@ def static_corridor_clear(
         poses: Sequence[Sequence[float]],
         footprint: Sequence[Sequence[float]],
         *, allow_rear_keepout_escape: bool = False,
+        live_checked_dock_occupancy: bool = False,
 ) -> bool:
     """
     Check a sampled footprint corridor against static map pixels.
@@ -1035,6 +1176,12 @@ def static_corridor_clear(
             or source['width'] != keepout['width']
             or source['height'] != keepout['height']):
         raise ValueError('map and keepout grids must have identical geometry')
+    if live_checked_dock_occupancy:
+        # Only fully occupied map pixels may yield to a live-checked dock path.
+        # Unknown pixels, keepout, map boundaries and the on-disk map stay intact.
+        occupied, free = (0, 255) if source['negate'] == 0 else (255, 0)
+        source = dict(source, pixels=bytes(
+            free if pixel == occupied else pixel for pixel in source['pixels']))
     resolution = source['resolution']
     if not math.isfinite(resolution) or resolution <= 0.0:
         raise ValueError('map resolution must be positive and finite')

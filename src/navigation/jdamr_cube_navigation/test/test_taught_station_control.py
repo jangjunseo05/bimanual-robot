@@ -38,9 +38,13 @@ def _node():
             }],
         }],
     }
-    node.parking_contract = {'robot_base_frame': 'base_link'}
+    node.parking_contract = {'robot_base_frame': 'base_link',
+                             'yaw_tolerance_rad': math.radians(3.)}
+    node.box_geometry = {'front_to_wheel_axis': {'value': .065}}
     node.station_reference = None
-    node.station_reference_profile = None
+    # Isolate worker state-machine cases from the separately tested depth join.
+    node._station_tape_surface = Mock(return_value={})
+    node.station_reference_profile = {'lateral_tolerance_m': .01}
     node.station_reference_rgb_info = None
     node.station_reference_result = None
     node.station_reference_result_received_s = None
@@ -51,6 +55,8 @@ def _node():
     node._station_reference_wake = threading.Event()
     node._station_reference_stop = threading.Event()
     node._station_reference_thread = None
+    node._station_reference_perception_active = True
+    node._observer_perception_enabled = False
     node.stop_requested = False
     node.parking_motion_revision = 0
     node.run_deadline_s = None
@@ -157,11 +163,11 @@ def test_profile_loads_hash_bound_registered_pose_and_one_rgb_pair(
     assert node.create_subscription.call_count == 2
     topics = [call.args[1] for call in node.create_subscription.call_args_list]
     assert topics == ['/camera/color/camera_info', '/camera/color/image_raw']
+    assert node._station_reference_perception_active is False
+    assert node._station_reference_thread is None
+    node._start_station_reference_perception()
     assert node._station_reference_thread.is_alive()
-    node._station_reference_stop.set()
-    node._station_reference_wake.set()
-    node._station_reference_thread.join(timeout=1.)
-    assert not node._station_reference_thread.is_alive()
+    node._stop_station_reference_perception()
 
 
 def test_profile_rejects_different_map_before_subscribing(tmp_path, monkeypatch):
@@ -200,6 +206,7 @@ def test_switch_from_water_rgbd_to_featureless_table_clears_the_old_reference(
     constructor = Mock(return_value=Mock())
     monkeypatch.setattr(box_service, 'TaughtStationReference', constructor)
     node.configure_station_reference(profile_path, 'water_station')
+    node._start_station_reference_perception()
     worker = node._station_reference_thread
     node.station_reference_goal = {'valid': True, 'goal_odom': [8., 8., 0.]}
     node.station_reference_goal_frozen = True
@@ -322,6 +329,7 @@ def test_worker_uses_image_stamp_tf_and_keeps_only_registered_pose_correction(mo
         'goal_odom': [1., .25, .2], 'stamp_s': 10., 'goal_left_offset_m': 0.,
     }
     node.station_reference = model
+    node._station_reference_perception_active = True
     node.parking_tf = Mock()
 
     def lookup(target, source, stamp, **kwargs):
@@ -380,7 +388,7 @@ def test_expired_match_never_seeds_control_but_can_seed_fresh_image_search():
                 'stamp_s': 10., 'goal_left_offset_m': 0.}
 
     model.observe.side_effect = observe
-    node._station_reference_pending = (None, None, 10.)
+    node._station_reference_pending = (None, SimpleNamespace(header=SimpleNamespace(frame_id='camera_color_optical_frame')), 10.)
     # End after this iteration, without timing-dependent sleeps.
     node.emit.side_effect = lambda *args, **kwargs: node._station_reference_stop.set()
     node._station_reference_wake.set()
@@ -397,7 +405,7 @@ def test_worker_preserves_tf_failure_detail_for_final_diagnostics():
     node.parking_tf = Mock()
     node.parking_tf.lookup_transform.side_effect = box_service.TransformException(
         'image timestamp is newer than available TF')
-    node._station_reference_pending = (None, None, 10.)
+    node._station_reference_pending = (None, SimpleNamespace(header=SimpleNamespace(frame_id='camera_color_optical_frame')), 10.)
     worker = threading.Thread(target=node._station_reference_loop)
     worker.start()
     node._station_reference_wake.set()
@@ -418,6 +426,7 @@ def test_rgb_callback_is_nonblocking_and_replaces_pending_frame():
     node = _node()
     model = Mock()
     node.station_reference = model
+    node._station_reference_perception_active = True
     node.station_reference_rgb_info = SimpleNamespace(
         header=SimpleNamespace(frame_id='camera_color_optical_frame'))
 
@@ -666,6 +675,111 @@ def test_destroy_stops_worker_before_ros_node(monkeypatch):
     destroyed.assert_called_once_with()
 
 
+def test_go_home_stops_station_rgb_worker_before_dock_return(monkeypatch):
+    node = _node()
+    node.station_reference = _rgbd_model()
+    node._station_reference_perception_active = True
+    node._station_reference_pending = ('queued-rgb', 'info', 10.)
+    node._set_observer_perception = Mock(return_value=True)
+    worker = threading.Thread(target=node._station_reference_loop)
+    node._station_reference_thread = worker
+    worker.start()
+    inherited = Mock(return_value='home')
+    monkeypatch.setattr(ServiceRoute, 'go_home', inherited)
+
+    assert node.go_home(execute=True, timeout_s=500.) == 'home'
+
+    assert node._station_reference_perception_active is False
+    assert node._station_reference_thread is None
+    assert node._station_reference_pending is None
+    assert not worker.is_alive()
+    inherited.assert_called_once_with(execute=True, timeout_s=500.)
+    node._set_observer_perception.assert_called_once_with(False)
+
+
+def test_go_home_keeps_lidar_route_when_depth_perception_cannot_disable(monkeypatch):
+    node = _node()
+    node._set_observer_perception = Mock(return_value=False)
+    inherited = Mock(return_value=True)
+    monkeypatch.setattr(ServiceRoute, 'go_home', inherited)
+
+    assert node.go_home(execute=True, timeout_s=500.) is True
+
+    inherited.assert_called_once_with(execute=True, timeout_s=500.)
+
+
+def test_go_home_keeps_lidar_route_when_station_worker_stop_times_out(monkeypatch):
+    node = _node()
+    node._stop_station_reference_perception = Mock(return_value=False)
+    node._set_observer_perception = Mock(return_value=True)
+    inherited = Mock(return_value=True)
+    monkeypatch.setattr(ServiceRoute, 'go_home', inherited)
+
+    assert node.go_home(execute=True, timeout_s=500.) is True
+
+    inherited.assert_called_once_with(execute=True, timeout_s=500.)
+
+
+def test_rear_box_parking_disables_front_depth_perception(monkeypatch):
+    node = _node()
+    node._set_observer_perception = Mock(return_value=True)
+    inherited = Mock(return_value='parked')
+    monkeypatch.setattr(box_service.RearBoxParkingMixin, 'park_rear_box', inherited)
+
+    assert node.park_rear_box('geometry', 'route', execute=True) == 'parked'
+
+    node._set_observer_perception.assert_called_once_with(False)
+    inherited.assert_called_once_with('geometry', 'route', execute=True)
+
+
+def test_station_rgb_callback_does_no_decode_after_perception_stops(monkeypatch):
+    node = _node()
+    node.station_reference = _rgbd_model()
+    node._station_reference_perception_active = False
+    decode = Mock(side_effect=AssertionError('RGB decode must stay off at the dock'))
+    monkeypatch.setattr(node, '_station_image_array', decode)
+
+    node._station_image_callback(object())
+
+    decode.assert_not_called()
+    assert node._station_reference_pending is None
+
+
+def test_station_worker_drops_inflight_result_when_perception_stops():
+    node = _node()
+    entered = threading.Event()
+    release = threading.Event()
+    model = _rgbd_model(contact_reference=None)
+
+    def observe(*_args):
+        entered.set()
+        assert release.wait(timeout=1.)
+        return {'valid': False, 'reason': 'late_result', 'stamp_s': 10.}
+
+    model.observe.side_effect = observe
+    node.station_reference = model
+    node._station_reference_perception_active = True
+    node.parking_tf = Mock()
+    node.parking_tf.lookup_transform.return_value = SimpleNamespace(transform=_pose())
+    node.get_clock.return_value = _clock(10.1)
+    node._station_reference_pending = (None, SimpleNamespace(header=SimpleNamespace(frame_id='camera_color_optical_frame')), 10.)
+    worker = threading.Thread(target=node._station_reference_loop)
+    node._station_reference_thread = worker
+    worker.start()
+    node._station_reference_wake.set()
+    assert entered.wait(timeout=1.)
+    stopped = threading.Thread(target=node._stop_station_reference_perception)
+    stopped.start()
+    release.set()
+    stopped.join(timeout=1.)
+
+    assert not stopped.is_alive()
+    assert not worker.is_alive()
+    assert node.station_reference_result is None
+    assert not any(call.args and call.args[0] == 'station_reference_input_status'
+                   for call in node.emit.call_args_list)
+
+
 def test_three_consistent_near_tape_views_replace_challenged_goal_without_arrival():
     node = _node()
     contact = Mock()
@@ -690,7 +804,7 @@ def test_three_consistent_near_tape_views_replace_challenged_goal_without_arriva
             'goal_left_offset_m': 0.,
             'quality': {'tape_center_base_xy_m': [.2, lateral]},
         }
-        node._station_reference_pending = (None, None, stamp)
+        node._station_reference_pending = (None, SimpleNamespace(header=SimpleNamespace(frame_id='camera_color_optical_frame')), stamp)
         node._station_reference_stop.clear()
         # Stop after a single worker iteration, including repeated statuses.
         node._station_reference_reported_status = None
@@ -714,6 +828,294 @@ def test_three_consistent_near_tape_views_replace_challenged_goal_without_arriva
     assert node._station_lateral_status()['lateral_reference_valid'] is False
 
 
+def test_frozen_tape_goal_detects_recorded_drift_against_held_destination():
+    node = _node()
+    contact = Mock()
+    node.station_reference = _rgbd_model(contact_reference=contact,
+                                        observation_method='table_front_tape')
+    node.station_reference_profile = {'lateral_tolerance_m': .005}
+    node.station_reference_mode = 'rgbd'
+    node.parking_contract['yaw_tolerance_rad'] = .03
+    held = {'valid': True, 'stamp_s': 9., 'goal_odom': [.4, 0., 0.]}
+    node._station_reference_goal_samples = deque([
+        {'valid': True, 'stamp_s': 9. + index * .2,
+         'goal_odom': [.4, lateral, 0.]}
+        for index, lateral in enumerate((.034, .035, .036))
+    ], maxlen=5)
+    node.station_reference_goal = dict(held)
+    node.station_reference_goal_frozen = True
+    node._station_terminal_goal = None
+    node.parking_tf = Mock()
+    node.parking_tf.lookup_transform.return_value = SimpleNamespace(transform=_pose())
+    node._odom_pose = Mock(return_value=(.39, 0., 0.))
+
+    for index, lateral in enumerate((.0394, .0396, .0395)):
+        stamp = 10. + index * .3
+        node.get_clock.return_value = _clock(stamp + .1)
+        node.station_reference.observe.return_value = {
+            'valid': True, 'stamp_s': stamp, 'goal_odom': [.4, lateral, 0.],
+            'goal_left_offset_m': 0.,
+            'quality': {'tape_center_base_xy_m': [.0484566, .0405519]},
+        }
+        node._station_reference_pending = (None, SimpleNamespace(header=SimpleNamespace(frame_id='camera_color_optical_frame')), stamp)
+        node._station_reference_stop.clear()
+        node._station_reference_reported_status = None
+        node.emit.side_effect = lambda *_a, **_kw: node._station_reference_stop.set()
+        node._station_reference_wake.set()
+        node._station_reference_loop()
+        node._fresh_station_reference = lambda: node.station_reference_result
+        if index == 0:
+            quality = node.station_reference_result['quality']
+            assert quality['static_goal_lateral_jump_m'] == pytest.approx(.0044)
+            assert quality['held_goal_lateral_jump_m'] == pytest.approx(.0394)
+            assert node._station_reference_challenged_goal['goal_odom'] == held['goal_odom']
+        if index < 2:
+            node._station_goal_reference(freeze=True)
+            assert node._station_terminal_goal is None
+
+    node.emit.side_effect = None
+    goal, _ = node._station_goal_reference(
+        freeze=True, continuous_rebase=True)
+
+    assert goal['goal_odom'] == pytest.approx([.4, .0395, 0.])
+    assert node._table_rebase_requires_restage
+    assert node._station_terminal_goal is None
+    rebased = [call for call in node.emit.call_args_list
+               if call.args and call.args[0] == 'table_station_goal_rebased']
+    assert rebased[-1].kwargs['continuous_approach_validation'] is False
+
+
+def test_first_continuous_approach_absorbs_coherent_five_mm_tape_correction():
+    node = _node()
+    contact = Mock()
+    node.station_reference = _rgbd_model(contact_reference=contact,
+                                        observation_method='table_front_tape')
+    node.station_reference_profile = {'lateral_tolerance_m': .005}
+    node.station_reference_mode = 'rgbd'
+    node.parking_contract['yaw_tolerance_rad'] = .03
+    held = {'valid': True, 'stamp_s': 9., 'goal_odom': [.4, 0., 0.]}
+    node._station_reference_goal_samples = deque([
+        {'valid': True, 'stamp_s': 9. + index * .2,
+         'goal_odom': [.4, lateral, 0.]}
+        for index, lateral in enumerate((-.0055, -.0060, -.0065))
+    ], maxlen=5)
+    node.station_reference_goal = dict(held)
+    node.station_reference_goal_frozen = True
+    node._station_terminal_goal = None
+    node.parking_tf = Mock()
+    node.parking_tf.lookup_transform.return_value = SimpleNamespace(transform=_pose())
+    node._odom_pose = Mock(return_value=(.39, 0., 0.))
+
+    goal = None
+    for index, lateral in enumerate((-.0070, -.0072, -.0071)):
+        stamp = 10. + index * .3
+        node.get_clock.return_value = _clock(stamp + .1)
+        node.station_reference.observe.return_value = {
+            'valid': True, 'stamp_s': stamp, 'goal_odom': [.4, lateral, 0.],
+            'goal_left_offset_m': 0.,
+            'quality': {'tape_center_base_xy_m': [.241, -.031]},
+        }
+        node._station_reference_pending = (None, SimpleNamespace(header=SimpleNamespace(frame_id='camera_color_optical_frame')), stamp)
+        node._station_reference_stop.clear()
+        node._station_reference_reported_status = None
+        node.emit.side_effect = lambda *_a, **_kw: node._station_reference_stop.set()
+        node._station_reference_wake.set()
+        node._station_reference_loop()
+        node._fresh_station_reference = lambda: node.station_reference_result
+        goal, _ = node._station_goal_reference(
+            freeze=True, continuous_rebase=True)
+        if index == 0:
+            assert node.station_reference_result['valid'] is True
+            assert node._station_reference_goal_correction_pending
+            assert not getattr(node, '_station_reference_goal_challenged', False)
+            assert not node._table_terminal_reference_ready(
+                node.station_reference_result)
+            status = node._station_lateral_status()
+            # The old frozen goal is still exactly centred at the base, but
+            # one soft correction frame cannot confirm final parking.
+            assert status['lateral_reference_valid'] is False
+            assert status['internal_lateral_within_tolerance'] is False
+            missing_stamp = stamp + .1
+            node.get_clock.return_value = _clock(missing_stamp + .1)
+            node.station_reference.observe.return_value = {
+                'valid': False, 'stamp_s': missing_stamp,
+                'reason': 'tape_pair_missing', 'quality': {},
+            }
+            node._station_reference_pending = (None, SimpleNamespace(header=SimpleNamespace(frame_id='camera_color_optical_frame')), missing_stamp)
+            node._station_reference_stop.clear()
+            node._station_reference_reported_status = None
+            node._station_reference_wake.set()
+            node._station_reference_loop()
+            assert node._station_reference_goal_correction_pending
+            assert len(node._station_reference_rebase_samples) == 1
+            assert not node._table_terminal_reference_ready(
+                node.station_reference_result)
+
+    assert goal['goal_odom'] == pytest.approx([.4, -.0071, 0.])
+    assert node.station_reference_goal['goal_odom'] == goal['goal_odom']
+    assert not node._table_rebase_requires_restage
+    rebased = [call for call in node.emit.call_args_list
+               if call.args and call.args[0] == 'table_station_goal_rebased']
+    assert rebased[-1].kwargs['continuous_approach_validation'] is True
+    assert rebased[-1].kwargs['restage_required'] is False
+
+
+def test_terminal_tape_goal_is_challenged_by_three_fresh_drifted_views():
+    node = _node()
+    contact = Mock()
+    node.station_reference = _rgbd_model(contact_reference=contact,
+                                        observation_method='table_front_tape')
+    node.station_reference_profile = {'lateral_tolerance_m': .005}
+    node.station_reference_mode = 'rgbd'
+    node.parking_contract['yaw_tolerance_rad'] = .03
+    terminal = {'valid': True, 'stamp_s': 9., 'goal_odom': [.4, 0., 0.]}
+    node._station_reference_goal_samples = deque([
+        {'valid': True, 'stamp_s': 9. + index * .2,
+         'goal_odom': [.4, lateral, 0.]}
+        for index, lateral in enumerate((.028, .030, .032))
+    ], maxlen=5)
+    node.station_reference_goal = dict(terminal)
+    node.station_reference_goal_frozen = True
+    node._station_terminal_goal = dict(terminal)
+    node.parking_tf = Mock()
+    node.parking_tf.lookup_transform.return_value = SimpleNamespace(transform=_pose())
+    node._odom_pose = Mock(return_value=(.39, 0., 0.))
+
+    for index, lateral in enumerate((.033, .034, .032)):
+        stamp = 10. + index * .4
+        node.get_clock.return_value = _clock(stamp + .1)
+        node.station_reference.observe.return_value = {
+            'valid': True, 'stamp_s': stamp, 'goal_odom': [.4, lateral, 0.],
+            'goal_left_offset_m': 0.,
+            'quality': {'tape_center_base_xy_m': [.0484566, lateral]},
+        }
+        node._station_reference_pending = (None, SimpleNamespace(header=SimpleNamespace(frame_id='camera_color_optical_frame')), stamp)
+        node._station_reference_stop.clear()
+        node._station_reference_reported_status = None
+        node.emit.side_effect = lambda *_a, **_kw: node._station_reference_stop.set()
+        node._station_reference_wake.set()
+        node._station_reference_loop()
+        node._fresh_station_reference = lambda: node.station_reference_result
+        if index < 2:
+            node._station_goal_reference(freeze=True)
+            assert node._station_terminal_goal is None
+            assert node._station_reference_goal_challenged
+            assert node._station_reference_challenged_goal['goal_odom'] == [0.4, 0., 0.]
+            missing_stamp = stamp + .2
+            node.get_clock.return_value = _clock(missing_stamp + .1)
+            node.station_reference.observe.return_value = {
+                'valid': False, 'stamp_s': missing_stamp,
+                'reason': 'tape_pair_missing', 'quality': {},
+            }
+            node._station_reference_pending = (None, SimpleNamespace(header=SimpleNamespace(frame_id='camera_color_optical_frame')), missing_stamp)
+            node._station_reference_stop.clear()
+            node._station_reference_reported_status = None
+            node._station_reference_wake.set()
+            node._station_reference_loop()
+            assert len(node._station_reference_rebase_samples) == index + 1
+
+    node.emit.side_effect = None
+    goal, _ = node._station_goal_reference(freeze=True)
+
+    assert goal['goal_odom'] == pytest.approx([.4, .033, 0.])
+    assert node._table_rebase_requires_restage
+    assert node._table_restage_tape_goal['goal_odom'] == goal['goal_odom']
+    assert contact.restore_tracking.call_count == 2
+
+
+def test_tape_rebase_close_view_range_uses_face_alignment_from_base_origin():
+    node = _node()
+    node.station_reference = SimpleNamespace(observation_method='table_front_tape')
+
+    def sample(stamp):
+        return dict(valid=True, stamp_s=stamp, goal_odom=[.4, .071, 0.],
+                    image_age_at_completion_s=.1,
+                    quality={'tape_center_base_xy_m': [.478, .071]})
+
+    assert node._consider_tape_rebase(sample(10.)) is None
+    assert node._consider_tape_rebase(sample(10.3)) is None
+    assert node._consider_tape_rebase(sample(10.6))['goal_filter_sample_count'] == 3
+
+
+def test_tape_rebase_accepts_recorded_center_inside_measured_front_extent():
+    node = _node()
+    node.station_reference = SimpleNamespace(observation_method='table_front_tape')
+
+    def sample(stamp, y):
+        return dict(valid=True, stamp_s=stamp, goal_odom=[.4, y, 0.],
+                    image_age_at_completion_s=.1,
+                    quality={'tape_center_base_xy_m': [.0484566338, .0405519012]})
+
+    assert node._consider_tape_rebase(sample(10., .0394)) is None
+    assert node._consider_tape_rebase(sample(10.3, .0396)) is None
+    rebased = node._consider_tape_rebase(sample(10.6, .0395))
+
+    assert rebased['goal_filter_sample_count'] == 3
+    assert rebased['goal_odom'] == pytest.approx([.4, .0395, 0.])
+    assert rebased['goal_filter_xy_spread_m'] == pytest.approx(.0001)
+    assert rebased['goal_filter_yaw_spread_rad'] == 0.
+
+
+def test_tape_rebase_remains_coherent_when_consumed_by_entry():
+    node = _node()
+    node.station_reference = SimpleNamespace(observation_method='table_front_tape')
+    node.station_reference_mode = 'rgbd'
+    rebased = None
+    for stamp, y in ((10., .0394), (10.2, .0396), (10.4, .0395)):
+        rebased = node._consider_tape_rebase(dict(
+            valid=True, stamp_s=stamp, goal_odom=[.4, y, 0.],
+            image_age_at_completion_s=.1,
+            quality={'tape_center_base_xy_m': [.35, .04]}))
+    node._station_reference_rebase_goal = rebased
+    node._station_reference_goal_correction_pending = True
+    node._fresh_station_reference = Mock(return_value=rebased)
+    node._odom_pose = Mock(return_value=(0., 0., 0.))
+    node.get_clock.return_value = _clock(10.5)
+    node._operator_link_ready = Mock(return_value=True)
+    anchored = {'tape_anchor': True}
+    node._station_anchor_target = Mock(return_value=anchored)
+
+    assert node._prepare_table_tape_entry({'map_anchor': True}) is anchored
+    assert node.station_reference_goal_frozen
+    assert node.station_reference_goal['goal_filter_xy_spread_m'] == pytest.approx(.0001)
+    assert node.station_reference_goal['goal_filter_yaw_spread_rad'] == 0.
+
+
+@pytest.mark.parametrize('dimension', ['lateral', 'yaw'])
+def test_tape_rebase_respects_station_coherence_limits(dimension):
+    node = _node()
+    node.station_reference = SimpleNamespace(observation_method='table_front_tape')
+    node.station_reference_profile['lateral_tolerance_m'] = .005
+    node.parking_contract['yaw_tolerance_rad'] = math.radians(1.)
+    for stamp in (10., 10.2):
+        assert node._consider_tape_rebase(dict(
+            valid=True, stamp_s=stamp, goal_odom=[.4, 0., 0.],
+            image_age_at_completion_s=.1,
+            quality={'tape_center_base_xy_m': [.35, 0.]})) is None
+    third = dict(valid=True, stamp_s=10.4,
+                 goal_odom=[.4, .007 if dimension == 'lateral' else 0.,
+                            math.radians(1.5) if dimension == 'yaw' else 0.],
+                 image_age_at_completion_s=.1,
+                 quality={'tape_center_base_xy_m': [.35, 0.]})
+    assert node._consider_tape_rebase(third) is None
+    assert len(node._station_reference_rebase_samples) == 1
+
+
+@pytest.mark.parametrize('geometry', [None, {},
+                                      {'front_to_wheel_axis': {'value': False}},
+                                      {'front_to_wheel_axis': {'value': '0.065'}}])
+def test_tape_rebase_rejects_malformed_chassis_geometry(geometry):
+    node = _node()
+    node.station_reference = SimpleNamespace(observation_method='table_front_tape')
+    node.box_geometry = geometry
+    candidate = dict(valid=True, stamp_s=10., goal_odom=[.4, .071, 0.],
+                     image_age_at_completion_s=.1,
+                     quality={'tape_center_base_xy_m': [.478, .071]})
+
+    assert node._consider_tape_rebase(candidate) is None
+    assert node._station_reference_rebase_samples == []
+
+
 @pytest.mark.parametrize('bad', ['duplicate', 'stale', 'far', 'outlier', 'not_tape'])
 def test_tape_rebase_does_not_accept_unconfirmed_frames(bad):
     node = _node()
@@ -731,3 +1133,167 @@ def test_tape_rebase_does_not_accept_unconfirmed_frames(bad):
     if bad == 'outlier': third['goal_odom'][1] = -.07
     if bad == 'not_tape': node.station_reference.observation_method = 'cup_bottle'
     assert node._consider_tape_rebase(third) is None
+
+
+@pytest.mark.parametrize('hard,age,discard', [
+    (False, .1, True), (True, .1, False), (False, 3., False),
+])
+def test_missing_pair_discards_only_unconfirmed_soft_goal_candidate(hard, age, discard):
+    node = _node()
+    contact = Mock()
+    node.station_reference = _rgbd_model(contact_reference=contact,
+                                        observation_method='table_front_tape')
+    node.station_reference_profile = {'lateral_tolerance_m': .005}
+    node.station_reference_mode = 'rgbd'
+    node.station_reference_goal = {
+        'valid': True, 'stamp_s': 9.9, 'goal_odom': [.4, 0., 0.],
+        'goal_filter_sample_count': 3}
+    node.station_reference_goal_frozen = True
+    node._station_reference_goal_correction_pending = True
+    node._station_reference_goal_challenged = hard
+    node._station_reference_rebase_samples = [{'goal_odom': [.4, .0052873, 0.]}]
+    node.parking_tf = Mock()
+    node.parking_tf.lookup_transform.return_value = SimpleNamespace(transform=_pose())
+    node.get_clock.return_value = _clock(10. + age)
+    node.station_reference.observe.return_value = {
+        'valid': False, 'stamp_s': 10., 'reason': 'tape_pair_missing', 'quality': {}}
+    node._station_reference_pending = (None, SimpleNamespace(header=SimpleNamespace(frame_id='camera_color_optical_frame')), 10.)
+    node.emit.side_effect = lambda *_a, **_kw: node._station_reference_stop.set()
+    node._station_reference_wake.set()
+    node._station_reference_loop()
+    assert node._station_reference_goal_correction_pending is (not discard)
+    assert node._station_reference_goal_challenged is hard
+    if discard:
+        assert node._station_reference_rebase_samples == []
+        assert node._table_terminal_reference_ready(node.station_reference_result)
+        assert node.station_reference_goal['goal_odom'] == [.4, 0., 0.]
+
+
+def test_terminal_hold_ignores_queued_soft_rebase_from_recorded_final_approach():
+    node = _node()
+    node.station_reference_mode = 'rgbd'
+    node.station_reference = _rgbd_model(observation_method='table_front_tape')
+    node.station_reference_profile = {'lateral_tolerance_m': .005}
+    terminal = {'valid': True, 'stamp_s': 10., 'goal_filter_sample_count': 3,
+                'goal_odom': [-.8257655896, 3.9196747358, 2.1776272699]}
+    changed = dict(terminal, stamp_s=10.5,
+                   goal_odom=[-.8336221787, 3.9124874027, 2.1759260628])
+    node.station_reference_goal = dict(terminal)
+    node._station_terminal_goal = dict(terminal)
+    node._station_reference_goal_correction_pending = True
+    node._station_reference_rebase_goal = changed
+    node._fresh_station_reference = Mock(return_value=changed)
+    goal, observed = node._station_goal_reference(freeze=True, continuous_rebase=True)
+    assert goal['goal_odom'] == terminal['goal_odom']
+    assert observed['goal_odom'] == changed['goal_odom']
+    assert node._station_reference_rebase_goal is None
+    assert not node._station_reference_goal_correction_pending
+    assert node._station_terminal_goal['goal_odom'] == terminal['goal_odom']
+
+
+def test_terminal_tape_worker_keeps_small_coherent_change_diagnostic():
+    node = _node()
+    contact = Mock()
+    node.station_reference = _rgbd_model(contact_reference=contact,
+                                        observation_method='table_front_tape')
+    node.station_reference_profile = {'lateral_tolerance_m': .005}
+    node.station_reference_mode = 'rgbd'
+    node.parking_contract['yaw_tolerance_rad'] = .03
+    held = {'valid': True, 'stamp_s': 9., 'goal_odom': [.4, 0., 0.],
+            'goal_filter_sample_count': 3}
+    node._station_reference_goal_samples = deque([
+        dict(held, stamp_s=9.+i*.2) for i in range(3)], maxlen=5)
+    node.station_reference_goal = dict(held)
+    node.station_reference_goal_frozen = True
+    node._station_terminal_goal = dict(held)
+    node.parking_tf = Mock()
+    node.parking_tf.lookup_transform.return_value = SimpleNamespace(transform=_pose())
+    for index, lateral in enumerate((.0104, .0106, .0105)):
+        stamp = 10. + index * .3
+        node.get_clock.return_value = _clock(stamp + .1)
+        node.station_reference.observe.return_value = {
+            'valid': True, 'stamp_s': stamp, 'goal_odom': [.4, lateral, 0.],
+            'goal_left_offset_m': 0.,
+            'quality': {'tape_center_base_xy_m': [.10, lateral]}}
+        node._station_reference_pending = (None, SimpleNamespace(header=SimpleNamespace(frame_id='camera_color_optical_frame')), stamp)
+        node._station_reference_stop.clear()
+        node._station_reference_reported_status = None
+        node.emit.side_effect = lambda *_a, **_kw: node._station_reference_stop.set()
+        node._station_reference_wake.set()
+        node._station_reference_loop()
+        node._fresh_station_reference = lambda: node.station_reference_result
+        goal, reference = node._station_goal_reference(freeze=True, continuous_rebase=True)
+        assert goal['goal_odom'] == held['goal_odom']
+        assert reference['goal_odom'][1] == lateral
+        assert not getattr(node, '_station_reference_goal_correction_pending', False)
+        assert getattr(node, '_station_reference_rebase_goal', None) is None
+
+
+@pytest.mark.parametrize('case', ['stale', 'wrong_frame', 'not_detected', 'skew'])
+def test_tape_depth_join_rejects_unusable_observer_geometry(case):
+    node = _node()
+    node._table_observation_context = ({'camera_mount': {}}, None, None)
+    node.get_clock.return_value = _clock(10.2)
+    doc = {'detected': True, 'frame_id': 'camera_color_optical_frame', 'stamp_s': 10.1}
+    if case == 'stale': doc['stamp_s'] = 9.6
+    if case == 'wrong_frame': doc['frame_id'] = 'unregistered_depth_frame'
+    if case == 'not_detected': doc['detected'] = False
+    if case == 'skew': doc['stamp_s'] = 9.8
+    node.box_status = doc
+    node.box_status_history = deque()
+    node.parking_tf = Mock()
+    with pytest.raises(ValueError, match='live depth table plane unavailable'):
+        BoxServiceRoute._station_tape_surface(
+            node, 10.15, (0.,0.,0.), 'camera_color_optical_frame')
+    node.parking_tf.lookup_transform.assert_not_called()
+
+
+def test_tape_worker_always_forwards_matched_live_surface():
+    node = _node()
+    node.station_reference = _rgbd_model(observation_method='table_front_tape')
+    node.parking_tf = Mock()
+    node.parking_tf.lookup_transform.return_value = SimpleNamespace(transform=_pose())
+    node.station_reference.observe.return_value = {
+        'valid': False, 'stamp_s': 10., 'reason': 'tape_pair_missing', 'quality': {}}
+    surface = {'source': 'live_depth_table_plane'}
+    node._station_tape_surface.return_value = surface
+    info = SimpleNamespace(header=SimpleNamespace(frame_id='camera_color_optical_frame'))
+    node._station_reference_pending = (None, info, 10.)
+    node.emit.side_effect = lambda *_a, **_kw: node._station_reference_stop.set()
+    node._station_reference_wake.set()
+    node._station_reference_loop()
+    node.station_reference.observe.assert_called_once_with(
+        None, info, (0.,0.,0.), 10., surface=surface)
+
+
+@pytest.mark.parametrize('stamp,available', [(9.8, True), (9.4, False), (10.1, False)])
+def test_tape_initial_goal_keeps_only_still_fresh_measured_samples(stamp, available):
+    node = _node()
+    node.station_reference = _rgbd_model(observation_method='table_front_tape')
+    node.station_reference_profile = {'lateral_tolerance_m': .005}
+    node.station_reference_mode = 'rgbd'
+    node.station_reference_goal = None
+    node.station_reference_control_goal = None
+    node.station_reference_goal_frozen = False
+    node._station_reference_goal_samples = deque([
+        {'valid': True, 'stamp_s': stamp, 'goal_odom': [.5, .014, 0.]}])
+    latest = {'valid': False, 'reason': 'station_reference_runtime:ValueError',
+              'detail': 'tape live depth table plane unavailable'}
+    node._fresh_station_reference = Mock(return_value=latest)
+    goal, reference = node._station_goal_reference(freeze=True)
+    assert (goal is not None) is available
+    if available:
+        assert goal['goal_odom'] == [.5, .014, 0.]
+    assert reference is latest and reference['valid'] is False
+    assert not node.station_reference_goal_frozen
+
+
+def test_profile_accepts_operator_ten_mm_lateral_tolerance(tmp_path, monkeypatch):
+    node = _node()
+    path = _profiles(tmp_path)
+    document = json.loads(path.read_text())
+    document['stations']['water_station']['lateral_tolerance_m'] = .01
+    path.write_text(json.dumps(document))
+    monkeypatch.setattr(box_service, 'TaughtStationReference', Mock(return_value=_rgbd_model()))
+    node.configure_station_reference(path, 'water_station')
+    assert node.station_reference_profile['lateral_tolerance_m'] == .01

@@ -402,6 +402,72 @@ def test_rejects_image_boundary_instead_of_calling_it_a_table_edge():
     assert detect_table_edge(depth, INTRINSICS, configured) is None
 
 
+def test_visible_tabletop_reports_plane_when_front_edge_is_out_of_view():
+    """A valid current tabletop fit survives a missing visible front edge."""
+    configured = config()
+    depth, _, _ = _render_table(
+        configured, front_x_m=0.05, width_m=2.0, depth_m=2.0)
+    plane_result = {'source': 'stale_previous_frame'}
+
+    detection = detect_table_edge(
+        depth, INTRINSICS, configured, plane_result=plane_result)
+
+    assert detection is None
+    assert plane_result['source'] == 'current_depth_tabletop_fit'
+    assert plane_result['inlier_count'] >= configured.minimum_inliers
+    assert plane_result['candidate_count'] >= plane_result['inlier_count']
+    assert plane_result['plane_rms_m'] <= configured.plane_distance_m
+    assert plane_result['table_height_m'] == pytest.approx(.75, abs=.015)
+    normal_optical = np.asarray(plane_result['plane_normal_optical'])
+    assert np.linalg.norm(normal_optical) == pytest.approx(1.)
+    expected_normal = (
+        _optical_to_level_rotation(configured).T @ np.array([0., 0., 1.]))
+    assert normal_optical @ expected_normal > .99
+    point_optical = np.asarray(plane_result['plane_point_optical_m'])
+    point_level = (
+        _optical_to_level_rotation(configured) @ point_optical)
+    assert configured.camera_height_m + point_level[2] == pytest.approx(
+        plane_result['table_height_m'])
+
+
+def test_plane_output_does_not_change_visible_edge_detection():
+    """Requesting plane provenance preserves the existing edge result."""
+    configured = config()
+    depth, _, _ = _render_table(configured, background_depth_m=1.8)
+    plane_result = {}
+
+    baseline = detect_table_edge(depth, INTRINSICS, configured)
+    with_plane = detect_table_edge(
+        depth, INTRINSICS, configured, plane_result=plane_result)
+
+    assert baseline is not None
+    assert with_plane == baseline
+    assert plane_result['source'] == 'current_depth_tabletop_fit'
+    assert plane_result['inlier_count'] == baseline.inlier_count
+    assert plane_result['candidate_count'] == baseline.candidate_count
+    assert plane_result['plane_rms_m'] == pytest.approx(baseline.plane_rms_m)
+
+
+@pytest.mark.parametrize('invalid_kind', ['floor', 'no_inliers'])
+def test_invalid_depth_clears_plane_result(invalid_kind):
+    """A failed plane fit cannot leak a result from an earlier frame."""
+    configured = config()
+    if invalid_kind == 'floor':
+        depth, _, _ = _render_table(
+            configured, table_height_m=0.0, front_x_m=0.1,
+            width_m=3.0, depth_m=3.0)
+    else:
+        depth = np.zeros(
+            (INTRINSICS.height, INTRINSICS.width), dtype=np.uint16)
+    plane_result = {'source': 'stale_previous_frame', 'inlier_count': 999}
+
+    detection = detect_table_edge(
+        depth, INTRINSICS, configured, plane_result=plane_result)
+
+    assert detection is None
+    assert plane_result == {}
+
+
 def test_near_edge_uses_later_measured_point_below_the_apron():
     configured = replace(config(1.26, 36.64), plane_distance_m=.025)
     rotation = _optical_to_level_rotation(configured)
