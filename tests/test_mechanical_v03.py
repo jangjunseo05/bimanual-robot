@@ -74,7 +74,7 @@ print(xacro.process_file(sys.argv[1]).toxml())
         self.assertEqual(spec["arm_mounts"]["right"]["xyz"], [20.0, -170.0, 726.0])
         self.assertEqual(
             spec["arm_mounts"]["left"]["gripper"],
-            "stock_so101_rotating_jaw_without_tpu_attachment",
+            "stock_so101_rotating_jaw_with_tpu_moving_jaw",
         )
         self.assertIsNone(spec["left_cup_gripper"]["selected_attachment"])
         self.assertFalse(
