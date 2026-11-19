@@ -22,7 +22,7 @@ def sample_spec() -> dict:
 def test_render_uses_single_sources() -> None:
     output = render(sample_spec())
     assert "450×340 mm" in output
-    assert "SO-101 순정 회전식 죠, TPU·오버캡 없음" in output
+    assert "SO-101 순정 회전식 죠, 무빙 죠만 TPU, 오버캡 없음" in output
     assert "FinRay 2개" not in output
     assert output.count(START) == 1
     assert output.count(END) == 1

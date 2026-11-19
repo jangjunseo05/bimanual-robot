@@ -32,7 +32,7 @@ def render(spec: dict) -> str:
             f"| 기계 개정 | `{spec['revision']}` |",
             f"| 상·하부 프레임 | {footprint_y:.0f}×{footprint_x:.0f} mm |",
             f"| 상판 높이 | {spec['chassis']['plates']['tabletop']['z_top']:.0f} mm |",
-            "| 왼손 | SO-101 순정 회전식 죠, TPU·오버캡 없음 |",
+            "| 왼손 | SO-101 순정 회전식 죠, 무빙 죠만 TPU, 오버캡 없음 |",
             f"| 오른손 | `{spec['right_parallel_gripper']['model']}` |",
             f"| RGB-D | {spec['camera']['model']}, 상판 위 {spec['camera']['height_above_tabletop']:.0f} mm |",
             f"| 베이스 | {navigation['drive_type']}, {navigation['motor']['model'] if 'motor' in navigation else navigation['reuse_source']['motor']} |",

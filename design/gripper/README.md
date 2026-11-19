@@ -1,12 +1,13 @@
 # 좌우 그리퍼 현행 구성과 과거 출력 후보
 
-현행 v0.3은 왼팔에 **SO-101 순정 회전식 죠를 TPU 부착물 없이 사용**하고, 오른팔에
+현행 v0.3은 왼팔에 **SO-101 순정 회전식 죠를 쓰되 무빙 죠만 TPU로 출력해 교체**하고, 오른팔에
 ggao50 `SO101-Parallel-Gripper` 순정 평면 죠를 쓴다. 80 mm FinRay와 왼쪽 컵 오버캡은
 과거 후보로만 보존한다. FinRay 로컬 출력물의 해시와 당시 조건은
 [`finray_80mm_lip3_selection.yaml`](finray_80mm_lip3_selection.yaml)에 남기지만 현행 출력·조립 기준이 아니다.
 
 ## 왼쪽 현행 사양: SO-101 순정 회전식 죠
 
+- 무빙 죠(`Moving_Jaw_SO101`)만 TPU로 출력해 교체한다. 고정 죠는 그리퍼 몸체와 한 부품이라 TPU로 바꿀 수 없어 순정 그대로 둔다(2026-11-19 실물 확인).
 - TPU FinRay, TPU 패드, 컵 오버캡을 장착하지 않는다.
 - URDF는 `src/description/hold_flow_description/urdf/so101_stock_gripper.xacro`를 사용한다.
 - FinRay 장착 때 기록한 ID 6 범위 `1454~2831`은 순정 죠 캘리브레이션으로 재사용하지 않는다.

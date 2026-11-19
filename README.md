@@ -113,7 +113,7 @@ python3 tools/jdamr/water_service_api.py stop
 | 기계 개정 | `2026-10-14_final_four_wheel_drive_selected` |
 | 상·하부 프레임 | 450×340 mm |
 | 상판 높이 | 720 mm |
-| 왼손 | SO-101 순정 회전식 죠, TPU·오버캡 없음 |
+| 왼손 | SO-101 순정 회전식 죠, 무빙 죠만 TPU, 오버캡 없음 |
 | 오른손 | `ggao50_SO101_Parallel_Gripper` |
 | RGB-D | Orbbec_Astra_S, 상판 위 540 mm |
 | 베이스 | skid_steer_four_wheel_drive, Feetech_STS3215_C018_12V |

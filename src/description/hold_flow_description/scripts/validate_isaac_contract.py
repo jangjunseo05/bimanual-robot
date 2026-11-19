@@ -113,7 +113,7 @@ def main() -> None:
     if mimic != ["right_finger2_joint"]:
         issues.append(f"mimic 관절 집합 불일치: {mimic}")
 
-    expected_left_gripper = "stock_so101_rotating_jaw_without_tpu_attachment"
+    expected_left_gripper = "stock_so101_rotating_jaw_with_tpu_moving_jaw"
     configured_left_gripper = spec["arm_mounts"]["left"]["gripper"]
     if configured_left_gripper != expected_left_gripper:
         issues.append(

@@ -2,7 +2,7 @@ schema_version: "1.0"
 decision_date: 2026-09-16
 status: superseded_not_for_current_build
 superseded_date: 2026-09-22
-superseded_by: stock_so101_rotating_jaw_without_tpu_attachment
+superseded_by: stock_so101_rotating_jaw_with_tpu_moving_jaw
 current_build_use: false
 
 role:
